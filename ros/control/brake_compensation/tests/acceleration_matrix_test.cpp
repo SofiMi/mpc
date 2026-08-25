@@ -197,6 +197,58 @@ TEST(BrakeCompensationBuilderTest, EventWithNoLocalizationSignalIsDropped) {
     }
 }
 
+// Regression test for: BuildProfile used to populate acceleration_segments
+// twice (once in its own loop, once again while building time_segments in a
+// second "for the same purpose" loop) but time_segments only once, so the
+// two ended up different lengths and not index-aligned. BuildProfileFromSamples
+// now fills both from a single loop, one push per sample.
+TEST(BrakeCompensationBuilderTest, SegmentsAreIndexAlignedWithMatchingSamples) {
+    BrakeCompensationBuilder builder(
+        /*release_threshold=*/-0.5, /*update_rate=*/1.0);
+
+    constexpr std::size_t kRampLen = 60;
+    const auto base = BuildBrakingSignal(/*peak_acc=*/-2.0, kRampLen, 15);
+    const auto target = ScaleSignal(base, 1.3);
+
+    FeedStreams(builder, base, target, /*speed=*/5.0);
+    FeedSettleGap(builder, 5.0);
+
+    const auto debug = builder.GetDebugInfo();
+    ASSERT_TRUE(debug.has_value());
+
+    for (const BrakeCompensationBuilder::BrakeProfile* profile :
+         {&debug->target, &debug->current}) {
+        ASSERT_EQ(profile->acceleration_segments.size(), 10u);
+        ASSERT_EQ(profile->time_segments.size(), 10u);
+
+        std::size_t total_samples = 0;
+        for (std::size_t i = 0; i < profile->acceleration_segments.size(); ++i) {
+            // The old bug doubled every entry in acceleration_segments only;
+            // same length here is exactly what would have caught it.
+            EXPECT_EQ(profile->acceleration_segments[i].size(), profile->time_segments[i].size())
+                << "interval " << i;
+            total_samples += profile->time_segments[i].size();
+
+            const double interval_begin =
+                profile->begin_time + profile->phase[i] * profile->duration;
+            const double interval_end =
+                profile->begin_time + profile->phase[i + 1] * profile->duration;
+            for (const double time : profile->time_segments[i]) {
+                EXPECT_GE(time, interval_begin - 1e-9) << "interval " << i;
+                EXPECT_LE(time, interval_end + 1e-9) << "interval " << i;
+            }
+        }
+        // The target profile's window holds its kept raw samples, i.e. close
+        // to kRampLen (smoothing can shift the detected peak by a few
+        // samples either way); the old bug doubled every entry, which would
+        // land near kRampLen * 2 here instead -- nowhere close to this bound.
+        if (profile == &debug->target) {
+            EXPECT_LE(total_samples, kRampLen);
+            EXPECT_GE(total_samples, kRampLen - 5);
+        }
+    }
+}
+
 TEST(BrakeCompensationBuilderTest, CoefficientAboveMaxIsClamped) {
     BrakeCompensationBuilder builder(
         /*release_threshold=*/-0.5, /*update_rate=*/1.0);
