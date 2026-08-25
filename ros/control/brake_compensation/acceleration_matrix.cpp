@@ -16,6 +16,37 @@ namespace yandex::sdc::control {
             return std::max(min_value, std::min(value, max_value));
         }
 
+        // Zero-means and unit-variances `values` in place; returns false (and
+        // leaves `values` untouched) if the series is too flat to normalize,
+        // e.g. a window with no real signal in it.
+        bool NormalizeInPlace(std::vector<double>& values) {
+            if (values.empty()) {
+                return false;
+            }
+            const double n = static_cast<double>(values.size());
+            double mean = 0.0;
+            for (const double value : values) {
+                mean += value;
+            }
+            mean /= n;
+
+            double variance = 0.0;
+            for (const double value : values) {
+                variance += (value - mean) * (value - mean);
+            }
+            variance /= n;
+
+            constexpr double kVarianceFloor = 1e-9;
+            const double stddev = std::sqrt(variance);
+            if (stddev <= kVarianceFloor) {
+                return false;
+            }
+            for (double& value : values) {
+                value = (value - mean) / stddev;
+            }
+            return true;
+        }
+
     } // namespace
 
     StructInterpolant2d<ScalarAsArray<double>>
@@ -41,23 +72,26 @@ namespace yandex::sdc::control {
         double peak_release_margin,
         std::size_t median_window,
         double min_braking_duration,
-        double max_event_time_offset,
-        double max_duration_ratio)
+        double min_lag,
+        double max_lag,
+        double lag_update_rate,
+        double min_lag_correlation)
         : release_threshold_(release_threshold)
         , update_rate_(Clamp(update_rate, 0.0, 1.0))
         , smoothing_half_(smoothing_window > 1 ? smoothing_window / 2 : 0)
         , peak_release_margin_(std::max(0.0, peak_release_margin))
         , median_half_(median_window > 1 ? median_window / 2 : 0)
         , min_braking_duration_(std::max(0.0, min_braking_duration))
-        , max_event_time_offset_(std::max(0.0, max_event_time_offset))
-        , max_duration_ratio_(std::max(1.0, max_duration_ratio)) {
+        , min_lag_(std::max(0.0, min_lag))
+        , max_lag_(std::max(min_lag_, max_lag))
+        , lag_update_rate_(Clamp(lag_update_rate, 0.0, 1.0))
+        , min_lag_correlation_(Clamp(min_lag_correlation, -1.0, 1.0)) {
         // The threshold is always used as a negative value: braking starts when
         // acceleration drops to or below it.
         if (release_threshold_ >= 0.0) {
             release_threshold_ = -std::abs(release_threshold_);
         }
         InitParams();
-
     }
 
     void BrakeCompensationBuilder::InitParams() {
@@ -85,19 +119,17 @@ namespace yandex::sdc::control {
         const double time = current_time_;
         current_time_ += kSamplePeriod;
 
+        if (IsFinite(localization_acc) && IsFinite(localization_vel)) {
+            localization_history_.push_back(Sample{time, localization_acc, localization_vel});
+        }
+
         Sample target_sample;
         target_sample.time = time;
         target_sample.acc = target_acc;
         target_sample.velocity = localization_vel;
+        PushSample(target_event_, target_sample);
 
-        Sample localization_sample;
-        localization_sample.time = time;
-        localization_sample.acc = localization_acc;
-        localization_sample.velocity = localization_vel;
-
-        PushSample(target_event_, target_sample, target_profiles_);
-        PushSample(localization_event_, localization_sample, localization_profiles_);
-        TryUpdateParams();
+        ProcessPendingTargetEvents();
     }
 
     std::vector<double> BrakeCompensationBuilder::MedianFilter(
@@ -127,9 +159,7 @@ namespace yandex::sdc::control {
     }
 
     void BrakeCompensationBuilder::PushSample(
-        ActiveEvent& event,
-        const Sample& sample,
-        std::deque<BrakeProfile>& completed_profiles) {
+        ActiveEvent& event, const Sample& sample) {
         if (!IsFinite(sample.acc) || !IsFinite(sample.velocity)) {
             return;
         }
@@ -149,13 +179,11 @@ namespace yandex::sdc::control {
         // returns to zero or above; the peak is then chosen from the whole buffer.
         event.samples.push_back(sample);
         if (sample.acc >= -0.2) {
-            CompleteEvent(event, completed_profiles);
+            CompleteEvent(event);
         }
     }
 
-    void BrakeCompensationBuilder::CompleteEvent(
-        ActiveEvent& event,
-        std::deque<BrakeProfile>& completed_profiles) {
+    void BrakeCompensationBuilder::CompleteEvent(ActiveEvent& event) {
         const std::vector<Sample> samples = std::move(event.samples);
         event = ActiveEvent{};
 
@@ -180,25 +208,22 @@ namespace yandex::sdc::control {
             return;
         }
 
-        BrakeEvent brake_event;
-        brake_event.samples.assign(
-            samples.begin(),
-            samples.begin() + static_cast<std::ptrdiff_t>(peak_index) + 1);
-        // Use the smoothed (de-noised) acceleration for the kept part so the
-        // integrals reflect the trend rather than the rectified noise.
-        for (std::size_t i = 0; i < brake_event.samples.size(); ++i) {
-            brake_event.samples[i].acc = smoothed[i];
+        // Keep the de-noised acceleration for the whole buffered event (not just
+        // the monotonic part): the release tail gives the shape a real minimum to
+        // anchor the lag search on later.
+        std::vector<Sample> smoothed_samples = samples;
+        for (std::size_t i = 0; i < smoothed_samples.size(); ++i) {
+            smoothed_samples[i].acc = smoothed[i];
         }
 
-        BrakeProfile profile = BuildProfile(brake_event);
-
-        if (profile.duration < min_braking_duration_) {
+        const double duration =
+            smoothed_samples[peak_index].time - smoothed_samples.front().time;
+        if (duration < min_braking_duration_) {
             return;
         }
 
-        if (!profile.delta_integral.empty()) {
-            completed_profiles.push_back(std::move(profile));
-        }
+        pending_target_events_.push_back(
+            PendingTargetEvent{std::move(smoothed_samples), peak_index});
     }
 
     std::vector<double> BrakeCompensationBuilder::SmoothAcceleration(
@@ -260,62 +285,186 @@ namespace yandex::sdc::control {
         return min_index;
     }
 
-    void BrakeCompensationBuilder::TryUpdateParams() {
-        while (!target_profiles_.empty() && !localization_profiles_.empty()) {
-            // The two streams are filtered independently (peak validity, minimum
-            // duration, ...), so either one can drop an event the other kept; a
-            // plain FIFO pairing would then silently match unrelated maneuvers and
-            // never recover. Guard the pairing by how far apart the two profiles'
-            // start times are: a gap larger than the known localization lag means
-            // the older profile's real counterpart never arrived, so it is
-            // discarded on its own rather than paired with a later, unrelated one.
-            const double offset = target_profiles_.front().begin_time -
-                localization_profiles_.front().begin_time;
-            if (offset > max_event_time_offset_) {
-                localization_profiles_.pop_front();
-                continue;
+    void BrakeCompensationBuilder::ProcessPendingTargetEvents() {
+        while (!pending_target_events_.empty()) {
+            const PendingTargetEvent& pending = pending_target_events_.front();
+            const double peak_time =
+                pending.smoothed_samples[pending.peak_index].time;
+            if (current_time_ < peak_time + max_lag_) {
+                // Localization hasn't caught up far enough yet to search the
+                // full [min_lag_, max_lag_] range for this event; try again on
+                // a later Set() call once more history has accumulated.
+                break;
             }
-            if (-offset > max_event_time_offset_) {
-                target_profiles_.pop_front();
-                continue;
-            }
+            PendingTargetEvent event = std::move(pending_target_events_.front());
+            pending_target_events_.pop_front();
+            MatchAndUpdate(event);
+        }
+        TrimLocalizationHistory();
+    }
 
-            BrakeProfile target_profile = std::move(target_profiles_.front());
-            BrakeProfile localization_profile =
-                std::move(localization_profiles_.front());
-            target_profiles_.pop_front();
-            localization_profiles_.pop_front();
-
-            // A matched pair whose durations are grossly disproportionate is not a
-            // reliable comparison: the shorter profile is just a handful of raw
-            // samples stretched onto the fixed kPhaseCount grid, so its per-phase
-            // values are dominated by interpolation/noise rather than the real
-            // maneuver. Drop the pair instead of folding a distorted coefficient
-            // into the table.
-            const double shorter_duration =
-                std::min(target_profile.duration, localization_profile.duration);
-            const double longer_duration =
-                std::max(target_profile.duration, localization_profile.duration);
-            if (shorter_duration <= kEpsilon ||
-                longer_duration / shorter_duration > max_duration_ratio_) {
-                continue;
-            }
-
-            UpdateParams(target_profile, localization_profile);
+    void BrakeCompensationBuilder::TrimLocalizationHistory() {
+        const double floor_time = pending_target_events_.empty()
+            ? current_time_ - max_lag_
+            : pending_target_events_.front().smoothed_samples.front().time;
+        while (!localization_history_.empty() &&
+               localization_history_.front().time < floor_time - kSamplePeriod) {
+            localization_history_.pop_front();
         }
     }
 
-    BrakeCompensationBuilder::BrakeProfile
-    BrakeCompensationBuilder::BuildProfile(const BrakeEvent& event) const {
-        BrakeProfile profile;
-        if (event.samples.size() < 2) {
-            return profile;
+    std::vector<BrakeCompensationBuilder::Sample>
+    BrakeCompensationBuilder::ExtractHistorySlice(
+        double begin_time, double end_time) const {
+        std::vector<Sample> slice;
+        if (localization_history_.empty() || end_time < begin_time) {
+            return slice;
+        }
+        auto first = std::lower_bound(
+            localization_history_.begin(),
+            localization_history_.end(),
+            begin_time,
+            [](const Sample& sample, double value) { return sample.time < value; });
+        if (first != localization_history_.begin()) {
+            --first; // one padding sample before the window, for interpolation
+        }
+        auto last = std::upper_bound(
+            localization_history_.begin(),
+            localization_history_.end(),
+            end_time,
+            [](double value, const Sample& sample) { return value < sample.time; });
+        if (last != localization_history_.end()) {
+            ++last; // one padding sample after the window
+        }
+        slice.assign(first, last);
+        return slice;
+    }
+
+    BrakeCompensationBuilder::LagEstimate BrakeCompensationBuilder::EstimateLag(
+        const std::vector<Sample>& target_event_samples) const {
+        LagEstimate result;
+        if (target_event_samples.size() < 2) {
+            return result;
         }
 
-        const double begin_time = event.samples.front().time;
-        const double end_time = event.samples.back().time;
-        const double duration = end_time - begin_time;
-        if (duration <= kEpsilon) {
+        const double t0 = target_event_samples.front().time;
+        const double t1 = target_event_samples.back().time;
+        const std::size_t m = target_event_samples.size();
+
+        std::vector<double> target_values(m);
+        for (std::size_t i = 0; i < m; ++i) {
+            target_values[i] = target_event_samples[i].acc;
+        }
+        if (!NormalizeInPlace(target_values)) {
+            return result; // target itself is flat -- nothing to correlate against
+        }
+
+        const std::vector<Sample> search_slice =
+            ExtractHistorySlice(t0 + min_lag_, t1 + max_lag_);
+        if (search_slice.size() < 2) {
+            return result;
+        }
+        const std::vector<double> smoothed_values = SmoothAcceleration(search_slice);
+        std::vector<Sample> smoothed_slice = search_slice;
+        for (std::size_t i = 0; i < smoothed_slice.size(); ++i) {
+            smoothed_slice[i].acc = smoothed_values[i];
+        }
+
+        double best_score = -2.0;
+        double best_lag = 0.0;
+        bool found = false;
+        std::vector<double> loc_values(m);
+
+        for (double lag = min_lag_; lag <= max_lag_ + kEpsilon; lag += kSamplePeriod) {
+            for (std::size_t i = 0; i < m; ++i) {
+                loc_values[i] = Interpolate(
+                    smoothed_slice, target_event_samples[i].time + lag, /*velocity=*/false);
+            }
+            if (!NormalizeInPlace(loc_values)) {
+                continue; // localization is flat around this candidate -- skip it
+            }
+
+            double score = 0.0;
+            for (std::size_t i = 0; i < m; ++i) {
+                score += target_values[i] * loc_values[i];
+            }
+            score /= static_cast<double>(m);
+
+            if (score > best_score) {
+                best_score = score;
+                best_lag = lag;
+                found = true;
+            }
+        }
+
+        if (found) {
+            result.valid = true;
+            result.lag = best_lag;
+            result.confidence = best_score;
+        }
+        return result;
+    }
+
+    void BrakeCompensationBuilder::MatchAndUpdate(const PendingTargetEvent& event) {
+        const std::vector<Sample> kept(
+            event.smoothed_samples.begin(),
+            event.smoothed_samples.begin() +
+                static_cast<std::ptrdiff_t>(event.peak_index) + 1);
+
+        const BrakeProfile target_profile = BuildProfileFromSamples(
+            kept, kept.front().time, kept.back().time - kept.front().time);
+        if (target_profile.phase.empty()) {
+            return;
+        }
+
+        const LagEstimate estimate = EstimateLag(event.smoothed_samples);
+
+        // Prefer this event's own lag estimate when it's confident enough;
+        // otherwise fall back to the last learned value rather than guessing.
+        double lag = current_lag_;
+        double confidence = current_lag_confidence_;
+        bool fresh_estimate_used = false;
+        if (estimate.valid && estimate.confidence >= min_lag_correlation_) {
+            lag = estimate.lag;
+            confidence = estimate.confidence;
+            fresh_estimate_used = true;
+        }
+
+        const std::vector<Sample> localization_slice = ExtractHistorySlice(
+            target_profile.begin_time + lag,
+            target_profile.begin_time + lag + target_profile.duration);
+        const BrakeProfile localization_profile = BuildProfileFromSamples(
+            localization_slice, target_profile.begin_time + lag, target_profile.duration);
+        if (localization_profile.phase.empty()) {
+            return;
+        }
+
+        // The shifted localization window must show real braking -- otherwise
+        // this match (fresh estimate or fallback to current_lag_) isn't
+        // trustworthy enough to fold into the table.
+        const double localization_min = *std::min_element(
+            localization_profile.acceleration.begin(),
+            localization_profile.acceleration.end());
+        if (localization_min > release_threshold_) {
+            return;
+        }
+
+        if (fresh_estimate_used) {
+            current_lag_ =
+                (1.0 - lag_update_rate_) * current_lag_ + lag_update_rate_ * lag;
+            current_lag_confidence_ = confidence;
+        }
+
+        UpdateParams(target_profile, localization_profile, lag, confidence);
+    }
+
+    BrakeCompensationBuilder::BrakeProfile
+    BrakeCompensationBuilder::BuildProfileFromSamples(
+        const std::vector<Sample>& samples,
+        double begin_time,
+        double duration) const {
+        BrakeProfile profile;
+        if (samples.size() < 2 || duration <= kEpsilon) {
             return profile;
         }
 
@@ -330,62 +479,42 @@ namespace yandex::sdc::control {
             const double phase = static_cast<double>(i) / (kPhaseCount - 1);
             const double time = begin_time + phase * duration;
             profile.phase[i] = phase;
-            profile.speed[i] = Interpolate(event.samples, time, /*velocity=*/true);
-            profile.acceleration[i] =
-                Interpolate(event.samples, time, /*velocity=*/false);
+            profile.speed[i] = Interpolate(samples, time, /*velocity=*/true);
+            profile.acceleration[i] = Interpolate(samples, time, /*velocity=*/false);
         }
 
         for (std::size_t i = 0; i + 1 < kPhaseCount; ++i) {
             const double t0 = begin_time + profile.phase[i] * duration;
             const double t1 = begin_time + profile.phase[i + 1] * duration;
-            profile.delta_integral[i] =
-                IntegrateAbsAcceleration(event.samples, t0, t1);
+            profile.delta_integral[i] = IntegrateAbsAcceleration(samples, t0, t1);
         }
 
         profile.acceleration_segments.resize(kPhaseCount - 1);
+        profile.time_segments.resize(kPhaseCount - 1);
 
-        // Времена границ интервалов
         std::vector<double> boundaries(kPhaseCount);
         for (std::size_t i = 0; i < kPhaseCount; ++i) {
             boundaries[i] = begin_time + profile.phase[i] * duration;
         }
 
-        for (const auto& sample : event.samples) {
-            // Найти интервал, в котором находится sample.time
-            // Считаем, что сэмплы с временем вне [begin_time, end_time] не попадают (но они внутри, т.к. samples обрезаны до peak_index)
-            // Используем upper_bound для границ
+        for (const auto& sample : samples) {
+            // Padding samples from ExtractHistorySlice can fall just outside the
+            // window; they exist only so Interpolate has real neighbors at the
+            // boundaries and shouldn't be attributed to a segment.
+            if (sample.time < boundaries.front() || sample.time > boundaries.back()) {
+                continue;
+            }
             auto it = std::upper_bound(boundaries.begin(), boundaries.end(), sample.time);
-            if (it == boundaries.begin() || it == boundaries.end()) {
-                // Сэмпл на границе или вне диапазона; можно отнести к ближайшему интервалу
-                // Проще: если время == begin_time, отнести к первому интервалу; если == end_time, к последнему.
-                if (sample.time <= boundaries.front()) {
-                    profile.acceleration_segments[0].push_back(sample.acc);
-                } else if (sample.time >= boundaries.back()) {
-                    profile.acceleration_segments.back().push_back(sample.acc);
-                }
-                continue;
+            std::size_t interval;
+            if (it == boundaries.begin()) {
+                interval = 0;
+            } else if (it == boundaries.end()) {
+                interval = boundaries.size() - 2;
+            } else {
+                interval = static_cast<std::size_t>(it - boundaries.begin() - 1);
             }
-            // it указывает на первый элемент > sample.time, значит интервал = it - boundaries.begin() - 1
-            std::size_t interval = static_cast<std::size_t>(it - boundaries.begin() - 1);
             profile.acceleration_segments[interval].push_back(sample.acc);
-        }
-
-        profile.time_segments.resize(kPhaseCount - 1);
-        for (const auto& sample : event.samples) {
-        auto it = std::upper_bound(boundaries.begin(), boundaries.end(), sample.time);
-            if (it == boundaries.begin() || it == boundaries.end()) {
-                if (sample.time <= boundaries.front()) {
-                    profile.acceleration_segments[0].push_back(sample.acc);
-                    profile.time_segments[0].push_back(sample.time);  // <-- время
-                } else if (sample.time >= boundaries.back()) {
-                    profile.acceleration_segments.back().push_back(sample.acc);
-                    profile.time_segments.back().push_back(sample.time);  // <-- время
-                }
-                continue;
-            }
-            std::size_t interval = static_cast<std::size_t>(it - boundaries.begin() - 1);
-            profile.acceleration_segments[interval].push_back(sample.acc);
-            profile.time_segments[interval].push_back(sample.time);  // <-- время
+            profile.time_segments[interval].push_back(sample.time);
         }
 
         return profile;
@@ -494,7 +623,9 @@ namespace yandex::sdc::control {
 
     void BrakeCompensationBuilder::UpdateParams(
         const BrakeProfile& target_profile,
-        const BrakeProfile& localization_profile) {
+        const BrakeProfile& localization_profile,
+        double lag,
+        double lag_confidence) {
         const std::size_t point_count = std::min(
             target_profile.acceleration.size(),
             localization_profile.acceleration.size());
@@ -587,18 +718,21 @@ namespace yandex::sdc::control {
             debug_info.coef_old = coef_old;
             debug_info.coef_new = coef_new;
             debug_info.coef_res = coef_res;
+            debug_info.lag = lag;
+            debug_info.lag_confidence = lag_confidence;
             debug_info_ = debug_info;
         }
     }
 
     void BrakeCompensationBuilder::Clear() {
         target_event_ = ActiveEvent{};
-        localization_event_ = ActiveEvent{};
-        target_profiles_.clear();
-        localization_profiles_.clear();
+        localization_history_.clear();
+        pending_target_events_.clear();
         current_time_ = 0.0;
+        current_lag_ = 0.0;
+        current_lag_confidence_ = 0.0;
         // Per the class doc, Clear() also resets the table itself, not just the
-        // in-flight event/queue state.
+        // in-flight event/history/lag state.
         InitParams();
     }
 
