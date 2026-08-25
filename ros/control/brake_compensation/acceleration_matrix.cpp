@@ -597,6 +597,9 @@ namespace yandex::sdc::control {
         target_profiles_.clear();
         localization_profiles_.clear();
         current_time_ = 0.0;
+        // Per the class doc, Clear() also resets the table itself, not just the
+        // in-flight event/queue state.
+        InitParams();
     }
 
     BrakeCompensationParams BrakeCompensationBuilder::GetParams() const {
