@@ -170,7 +170,7 @@ TEST(BrakeCompensationBuilderTest, DelayedAndScaledEventRecoversLagAndCoefficien
     const auto debug = builder.GetDebugInfo();
     ASSERT_TRUE(debug.has_value());
     EXPECT_NEAR(debug->lag, kTrueLag, 1e-6);
-    EXPECT_DOUBLE_EQ(debug->lag_confidence, 1.0); // a fresh crossing was found
+    EXPECT_TRUE(debug->lag_is_fresh); // a fresh crossing was found
 
     ASSERT_FALSE(debug->coef_new.empty());
     for (const double coefficient : debug->coef_new) {
@@ -230,6 +230,40 @@ TEST(BrakeCompensationBuilderTest, LocalizationCrossingBeyondMaxLagIsNotUsed) {
     FeedStreams(builder, localization, target, /*speed=*/5.0);
     FeedSettleGap(builder, 5.0);
 
+    EXPECT_FALSE(builder.GetDebugInfo().has_value());
+    for (const double value : builder.GetParams().value_points) {
+        EXPECT_DOUBLE_EQ(value, 1.0);
+    }
+}
+
+// Regression test for a real observed failure: localization has no real
+// data anywhere near the start of the (fallback) window, only a short real
+// burst deep inside it -- well past where the lag search could have found
+// it (it's beyond max_lag_), but still within the target event's own long
+// duration. Interpolate would clamp every early query point to that burst's
+// first (deep) value, producing a profile that looks like it braked hard
+// from the very start when in fact there's no real data there at all.
+TEST(BrakeCompensationBuilderTest, SparseLocalizationCoverageIsRejectedNotClampedIntoAMatch) {
+    BrakeCompensationBuilder builder(/*release_threshold=*/-0.5, /*update_rate=*/1.0);
+
+    // A long event so the fallback window (lag=0, since no crossing will be
+    // found within max_lag_) comfortably contains the late burst.
+    const auto target = BuildBrakingSignal(/*peak_acc=*/-1.5, 140, 15); // ~2.7s
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    std::vector<double> localization(target.size(), nan);
+    constexpr std::size_t kBurstStart = 110; // 2.2s: beyond max_lag_ (2.0s),
+                                              // but inside the ~2.7s event
+    for (std::size_t i = 0; i < 12; ++i) {
+        localization[kBurstStart + i] = -0.9 - 0.01 * static_cast<double>(i);
+    }
+
+    FeedStreams(builder, localization, target, /*speed=*/5.0);
+    FeedSettleGap(builder, 5.0);
+
+    // No crossing is found within max_lag_, so lag falls back to 0. The
+    // resulting window has no real localization coverage before ~2.2s --
+    // the match must be rejected rather than built from clamped values.
     EXPECT_FALSE(builder.GetDebugInfo().has_value());
     for (const double value : builder.GetParams().value_points) {
         EXPECT_DOUBLE_EQ(value, 1.0);

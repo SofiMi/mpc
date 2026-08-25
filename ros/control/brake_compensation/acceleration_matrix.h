@@ -65,9 +65,14 @@ namespace yandex::sdc::control {
     //     rather than assumed); if nothing crosses the threshold in range, the
     //     last learned current_lag_ is used as a fallback instead of guessing.
     //     Either way, the resulting localization window
-    //     [begin_time + lag, peak_time + lag] is sanity-checked (it must still
-    //     dip to release_threshold_ or below) before the pair is used, so a
-    //     bad match cannot corrupt the table.
+    //     [begin_time + lag, peak_time + lag] must have continuous real
+    //     localization coverage (see kMaxHistoryGap) before it's even built:
+    //     otherwise Interpolate would clamp to (or bridge across) whatever
+    //     real sample is nearest, however far away, which can be deep enough
+    //     to pass a plain magnitude check despite belonging to an unrelated
+    //     moment. A covered window is then still sanity-checked (it must dip
+    //     to release_threshold_ or below) before the pair is used, so a bad
+    //     match cannot corrupt the table.
     //   * Because the localization profile is always built over a window whose
     //     length equals the target profile's, there is no independent
     //     localization duration to mismatch, and no separate profile queue to
@@ -133,11 +138,11 @@ namespace yandex::sdc::control {
             std::vector<double> coef_new;
             std::vector<double> coef_res;
 
-            double lag = 0.0;            // lag applied for this update (seconds)
-            double lag_confidence = 0.0; // 1.0 if this event's own localization
-                                          // entry crossing was found (fresh
-                                          // lag), 0.0 if it fell back to the
-                                          // last learned current_lag_
+            double lag = 0.0;         // lag applied for this update (seconds)
+            bool lag_is_fresh = false; // true if this event's own localization
+                                        // entry crossing was found; false if it
+                                        // fell back to the last learned
+                                        // current_lag_
         };
 
         std::optional<BrakeCompensationBuilder::DebugInfo> GetDebugInfo();
@@ -171,6 +176,17 @@ namespace yandex::sdc::control {
         static constexpr double kSamplePeriod = 0.02;
         static constexpr std::size_t kPhaseCount = 11; // phases 0.0 .. 1.0 step 0.1
         static constexpr double kEpsilon = 1e-9;
+        // Max allowed gap, anywhere in [begin_time, end_time], between the
+        // window's edges and the nearest real localization sample, and
+        // between consecutive real samples, for that window to be considered
+        // genuinely covered (see MatchAndUpdate). A few sample periods
+        // tolerates the occasional dropped (non-finite) sample without
+        // accepting a window that Interpolate would mostly fill in by
+        // clamping to (or bridging across) a stretch with no real data --
+        // which can still look "deep enough" to pass the plain magnitude
+        // check below, since the clamped value is a real sample, just from
+        // an unrelated moment.
+        static constexpr double kMaxHistoryGap = 3 * kSamplePeriod;
 
         void InitParams();
 
@@ -232,7 +248,7 @@ namespace yandex::sdc::control {
             const BrakeProfile& target_profile,
             const BrakeProfile& localization_profile,
             double lag,
-            double lag_confidence);
+            bool lag_is_fresh);
 
         std::size_t FindNearestSpeedIndex(double speed) const;
         std::size_t FindNearestAccelerationIndex(double acceleration) const;

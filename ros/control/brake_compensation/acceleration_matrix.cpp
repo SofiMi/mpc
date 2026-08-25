@@ -16,6 +16,35 @@ namespace yandex::sdc::control {
             return std::max(min_value, std::min(value, max_value));
         }
 
+        // Whether `samples` (sorted by time) has continuous real coverage
+        // across [begin_time, end_time]: real data reaching within `max_gap`
+        // of both edges, and no gap between consecutive samples wider than
+        // `max_gap` anywhere in between. Templated (rather than named on
+        // BrakeCompensationBuilder::Sample) only so this free function
+        // doesn't need access to that private nested type.
+        template <typename SampleT>
+        bool HasContinuousCoverage(
+            const std::vector<SampleT>& samples,
+            double begin_time,
+            double end_time,
+            double max_gap) {
+            if (samples.empty()) {
+                return false;
+            }
+            if (samples.front().time > begin_time + max_gap) {
+                return false;
+            }
+            if (samples.back().time < end_time - max_gap) {
+                return false;
+            }
+            for (std::size_t i = 1; i < samples.size(); ++i) {
+                if (samples[i].time - samples[i - 1].time > max_gap) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
     } // namespace
 
     StructInterpolant2d<ScalarAsArray<double>>
@@ -357,11 +386,25 @@ namespace yandex::sdc::control {
             fresh_estimate_used = true;
         }
 
-        const std::vector<Sample> localization_slice = ExtractHistorySlice(
-            target_profile.begin_time + lag,
-            target_profile.begin_time + lag + target_profile.duration);
+        const double window_begin = target_profile.begin_time + lag;
+        const double window_end = window_begin + target_profile.duration;
+        const std::vector<Sample> localization_slice =
+            ExtractHistorySlice(window_begin, window_end);
+
+        // The window needs continuous real localization coverage before it's
+        // even built: otherwise Interpolate would clamp to (or bridge
+        // across) whatever real sample is nearest, however far away -- which
+        // can still be deep enough to pass the plain magnitude check below,
+        // since it's a real sample, just from an unrelated moment (this is
+        // exactly how a match on a mostly-empty window used to sneak
+        // through: the whole window read back as one repeated, distant
+        // sample that happened to be deep).
+        if (!HasContinuousCoverage(localization_slice, window_begin, window_end, kMaxHistoryGap)) {
+            return;
+        }
+
         const BrakeProfile localization_profile = BuildProfileFromSamples(
-            localization_slice, target_profile.begin_time + lag, target_profile.duration);
+            localization_slice, window_begin, target_profile.duration);
         if (localization_profile.phase.empty()) {
             return;
         }
@@ -381,7 +424,7 @@ namespace yandex::sdc::control {
                 (1.0 - lag_update_rate_) * current_lag_ + lag_update_rate_ * lag;
         }
 
-        UpdateParams(target_profile, localization_profile, lag, fresh_estimate_used ? 1.0 : 0.0);
+        UpdateParams(target_profile, localization_profile, lag, fresh_estimate_used);
     }
 
     BrakeCompensationBuilder::BrakeProfile
@@ -551,7 +594,7 @@ namespace yandex::sdc::control {
         const BrakeProfile& target_profile,
         const BrakeProfile& localization_profile,
         double lag,
-        double lag_confidence) {
+        bool lag_is_fresh) {
         const std::size_t point_count = std::min(
             target_profile.acceleration.size(),
             localization_profile.acceleration.size());
@@ -645,7 +688,7 @@ namespace yandex::sdc::control {
             debug_info.coef_new = coef_new;
             debug_info.coef_res = coef_res;
             debug_info.lag = lag;
-            debug_info.lag_confidence = lag_confidence;
+            debug_info.lag_is_fresh = lag_is_fresh;
             debug_info_ = debug_info;
         }
     }
