@@ -41,27 +41,33 @@ namespace yandex::sdc::control {
     //     returns to zero or above. Only the monotonically deepening part, from
     //     the start to the first local minimum (the peak of braking), is kept.
     //   * The localization stream is never independently thresholded or peak-
-    //     detected -- its raw samples are just kept in a rolling history buffer
-    //     (localization_history_). Detecting braking independently on both
-    //     streams and then matching by normalized phase used to be how this
-    //     worked, but that conflates two unrelated things: the real, physical
-    //     lag between the streams, and each stream's own onset-detection noise
-    //     (a noisier signal crosses its own threshold later and already deeper
-    //     than it should be) -- which silently distorted the phase-0 point.
+    //     detected as its own event -- its raw samples are just kept in a
+    //     rolling history buffer (localization_history_). Detecting braking
+    //     independently on both streams and matching by normalized phase used
+    //     to be how this worked, but that conflates the real physical lag
+    //     between the streams with each stream's own onset-detection noise (a
+    //     noisier signal crosses its own threshold later and already deeper
+    //     than it should be), which silently distorted the phase-0 point. A
+    //     cross-correlation-based lag search was tried next, but proved too
+    //     easy to fool: Interpolate can't distinguish "real data here" from
+    //     "clamped to the nearest edge sample of a stretch with nothing in
+    //     it", so a sparse/gappy localization history could still score a
+    //     passable correlation at a bogus lag.
     //   * Instead, once a target event's kept (monotonic) window
-    //     [begin_time, peak_time] is known, the matching localization window is
-    //     [begin_time + lag, peak_time + lag] for an explicitly estimated time
-    //     lag: for each event, a candidate lag in [min_lag_, max_lag_] is chosen
-    //     by normalized cross-correlation between the target event's full
-    //     buffered shape (deepening + release, which has a real minimum to
-    //     anchor on, unlike the plain monotonic ramp) and the localization
-    //     history shifted by that candidate. A confident per-event estimate
-    //     updates current_lag_ (an EMA, so a car's actual brake/estimation lag
-    //     is learned over time instead of assumed); a low-confidence one falls
-    //     back to the current current_lag_ without updating it. Either way, the
-    //     resulting localization window is sanity-checked (it must show real
-    //     braking, i.e. dip at or below release_threshold_) before the pair is
-    //     used, so a bad match cannot corrupt the table.
+    //     [begin_time, peak_time] is known, localization_history_ is scanned
+    //     forward from begin_time + min_lag_ (up to begin_time + max_lag_) for
+    //     the first sample at or below localization_entry_threshold_ -- the
+    //     same kind of simple entry-threshold crossing already used to detect
+    //     the target's own event, just applied to localization and scoped to
+    //     search only near this specific target event. That crossing's offset
+    //     from begin_time is the lag. A found lag updates current_lag_ (an
+    //     EMA, so a car's actual brake/estimation lag is learned over time
+    //     rather than assumed); if nothing crosses the threshold in range, the
+    //     last learned current_lag_ is used as a fallback instead of guessing.
+    //     Either way, the resulting localization window
+    //     [begin_time + lag, peak_time + lag] is sanity-checked (it must still
+    //     dip to release_threshold_ or below) before the pair is used, so a
+    //     bad match cannot corrupt the table.
     //   * Because the localization profile is always built over a window whose
     //     length equals the target profile's, there is no independent
     //     localization duration to mismatch, and no separate profile queue to
@@ -84,7 +90,7 @@ namespace yandex::sdc::control {
             double min_lag = 0.0,
             double max_lag = 2.0,
             double lag_update_rate = 0.2,
-            double min_lag_correlation = 0.5);
+            double localization_entry_threshold = -0.3);
 
         // Feed one synchronized measurement. `localization_vel` is the current
         // speed, used both as the profile speed and as the table's speed key.
@@ -128,10 +134,10 @@ namespace yandex::sdc::control {
             std::vector<double> coef_res;
 
             double lag = 0.0;            // lag applied for this update (seconds)
-            double lag_confidence = 0.0; // cross-correlation score, [-1, 1];
-                                          // equals the fallback current_lag_'s
-                                          // last known confidence when this
-                                          // event's own estimate wasn't used
+            double lag_confidence = 0.0; // 1.0 if this event's own localization
+                                          // entry crossing was found (fresh
+                                          // lag), 0.0 if it fell back to the
+                                          // last learned current_lag_
         };
 
         std::optional<BrakeCompensationBuilder::DebugInfo> GetDebugInfo();
@@ -151,16 +157,14 @@ namespace yandex::sdc::control {
 
         // A target event that finished its monotonic deepening part but is not
         // yet matchable: the localization history needs to accumulate up to
-        // peak_time + max_lag_ before every candidate lag is checkable.
+        // peak_time + max_lag_ before the whole lag search window is available.
         struct PendingTargetEvent {
-            std::vector<Sample> smoothed_samples; // full buffered event, smoothed
-            std::size_t peak_index = 0;           // end of the kept (monotonic)
-                                                   // part within smoothed_samples
+            std::vector<Sample> kept_samples; // the kept (monotonic) part,
+                                               // smoothed
         };
 
         struct LagEstimate {
             double lag = 0.0;
-            double confidence = -2.0; // Pearson r is in [-1, 1]; -2 == invalid
             bool valid = false;
         };
 
@@ -193,11 +197,11 @@ namespace yandex::sdc::control {
         // arrived; drop stale history no longer needed by any pending event.
         void ProcessPendingTargetEvents();
 
-        // Estimate the lag between `target_event_samples` (a target event's
-        // full smoothed buffer -- deepening plus release, so it has a real
-        // minimum to anchor on) and localization_history_, by normalized
-        // cross-correlation over candidate lags in [min_lag_, max_lag_].
-        LagEstimate EstimateLag(const std::vector<Sample>& target_event_samples) const;
+        // Find the lag between a target event starting at `begin_time` and
+        // localization: the offset (within [min_lag_, max_lag_]) of the first
+        // localization_history_ sample at or below
+        // localization_entry_threshold_.
+        LagEstimate EstimateLag(double begin_time) const;
 
         // Copy of localization_history_ covering [begin_time, end_time], plus
         // one padding sample on each side (when available) for interpolation.
@@ -254,11 +258,9 @@ namespace yandex::sdc::control {
                                       // how long a completed event waits for
                                       // localization history before matching
         double lag_update_rate_;     // EMA rate for current_lag_
-        double min_lag_correlation_; // confidence floor to trust a fresh
-                                      // per-event lag estimate over current_lag_
+        double localization_entry_threshold_; // localization's own onset
+                                               // threshold (stored negative)
         double current_lag_ = 0.0;   // learned target->localization lag (s)
-        double current_lag_confidence_ = 0.0; // confidence of current_lag_'s
-                                               // last accepted fresh estimate
     };
 
 } // namespace yandex::sdc::control

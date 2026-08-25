@@ -16,37 +16,6 @@ namespace yandex::sdc::control {
             return std::max(min_value, std::min(value, max_value));
         }
 
-        // Zero-means and unit-variances `values` in place; returns false (and
-        // leaves `values` untouched) if the series is too flat to normalize,
-        // e.g. a window with no real signal in it.
-        bool NormalizeInPlace(std::vector<double>& values) {
-            if (values.empty()) {
-                return false;
-            }
-            const double n = static_cast<double>(values.size());
-            double mean = 0.0;
-            for (const double value : values) {
-                mean += value;
-            }
-            mean /= n;
-
-            double variance = 0.0;
-            for (const double value : values) {
-                variance += (value - mean) * (value - mean);
-            }
-            variance /= n;
-
-            constexpr double kVarianceFloor = 1e-9;
-            const double stddev = std::sqrt(variance);
-            if (stddev <= kVarianceFloor) {
-                return false;
-            }
-            for (double& value : values) {
-                value = (value - mean) / stddev;
-            }
-            return true;
-        }
-
     } // namespace
 
     StructInterpolant2d<ScalarAsArray<double>>
@@ -75,7 +44,7 @@ namespace yandex::sdc::control {
         double min_lag,
         double max_lag,
         double lag_update_rate,
-        double min_lag_correlation)
+        double localization_entry_threshold)
         : release_threshold_(release_threshold)
         , update_rate_(Clamp(update_rate, 0.0, 1.0))
         , smoothing_half_(smoothing_window > 1 ? smoothing_window / 2 : 0)
@@ -85,11 +54,14 @@ namespace yandex::sdc::control {
         , min_lag_(std::max(0.0, min_lag))
         , max_lag_(std::max(min_lag_, max_lag))
         , lag_update_rate_(Clamp(lag_update_rate, 0.0, 1.0))
-        , min_lag_correlation_(Clamp(min_lag_correlation, -1.0, 1.0)) {
-        // The threshold is always used as a negative value: braking starts when
-        // acceleration drops to or below it.
+        , localization_entry_threshold_(localization_entry_threshold) {
+        // Both thresholds are always used as negative values: braking starts
+        // when acceleration drops to or below them.
         if (release_threshold_ >= 0.0) {
             release_threshold_ = -std::abs(release_threshold_);
+        }
+        if (localization_entry_threshold_ >= 0.0) {
+            localization_entry_threshold_ = -std::abs(localization_entry_threshold_);
         }
         InitParams();
     }
@@ -208,22 +180,21 @@ namespace yandex::sdc::control {
             return;
         }
 
-        // Keep the de-noised acceleration for the whole buffered event (not just
-        // the monotonic part): the release tail gives the shape a real minimum to
-        // anchor the lag search on later.
-        std::vector<Sample> smoothed_samples = samples;
-        for (std::size_t i = 0; i < smoothed_samples.size(); ++i) {
-            smoothed_samples[i].acc = smoothed[i];
+        // Keep only the kept (monotonic deepening) part, using the de-noised
+        // acceleration so the integrals reflect the trend rather than the
+        // rectified noise.
+        std::vector<Sample> kept(
+            samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(peak_index) + 1);
+        for (std::size_t i = 0; i < kept.size(); ++i) {
+            kept[i].acc = smoothed[i];
         }
 
-        const double duration =
-            smoothed_samples[peak_index].time - smoothed_samples.front().time;
+        const double duration = kept.back().time - kept.front().time;
         if (duration < min_braking_duration_) {
             return;
         }
 
-        pending_target_events_.push_back(
-            PendingTargetEvent{std::move(smoothed_samples), peak_index});
+        pending_target_events_.push_back(PendingTargetEvent{std::move(kept)});
     }
 
     std::vector<double> BrakeCompensationBuilder::SmoothAcceleration(
@@ -288,8 +259,7 @@ namespace yandex::sdc::control {
     void BrakeCompensationBuilder::ProcessPendingTargetEvents() {
         while (!pending_target_events_.empty()) {
             const PendingTargetEvent& pending = pending_target_events_.front();
-            const double peak_time =
-                pending.smoothed_samples[pending.peak_index].time;
+            const double peak_time = pending.kept_samples.back().time;
             if (current_time_ < peak_time + max_lag_) {
                 // Localization hasn't caught up far enough yet to search the
                 // full [min_lag_, max_lag_] range for this event; try again on
@@ -306,7 +276,7 @@ namespace yandex::sdc::control {
     void BrakeCompensationBuilder::TrimLocalizationHistory() {
         const double floor_time = pending_target_events_.empty()
             ? current_time_ - max_lag_
-            : pending_target_events_.front().smoothed_samples.front().time;
+            : pending_target_events_.front().kept_samples.front().time;
         while (!localization_history_.empty() &&
                localization_history_.front().time < floor_time - kSamplePeriod) {
             localization_history_.pop_front();
@@ -341,92 +311,49 @@ namespace yandex::sdc::control {
     }
 
     BrakeCompensationBuilder::LagEstimate BrakeCompensationBuilder::EstimateLag(
-        const std::vector<Sample>& target_event_samples) const {
+        double begin_time) const {
         LagEstimate result;
-        if (target_event_samples.size() < 2) {
-            return result;
-        }
 
-        const double t0 = target_event_samples.front().time;
-        const double t1 = target_event_samples.back().time;
-        const std::size_t m = target_event_samples.size();
+        const double search_begin = begin_time + min_lag_;
+        const double search_end = begin_time + max_lag_;
 
-        std::vector<double> target_values(m);
-        for (std::size_t i = 0; i < m; ++i) {
-            target_values[i] = target_event_samples[i].acc;
-        }
-        if (!NormalizeInPlace(target_values)) {
-            return result; // target itself is flat -- nothing to correlate against
-        }
-
-        const std::vector<Sample> search_slice =
-            ExtractHistorySlice(t0 + min_lag_, t1 + max_lag_);
-        if (search_slice.size() < 2) {
-            return result;
-        }
-        const std::vector<double> smoothed_values = SmoothAcceleration(search_slice);
-        std::vector<Sample> smoothed_slice = search_slice;
-        for (std::size_t i = 0; i < smoothed_slice.size(); ++i) {
-            smoothed_slice[i].acc = smoothed_values[i];
-        }
-
-        double best_score = -2.0;
-        double best_lag = 0.0;
-        bool found = false;
-        std::vector<double> loc_values(m);
-
-        for (double lag = min_lag_; lag <= max_lag_ + kEpsilon; lag += kSamplePeriod) {
-            for (std::size_t i = 0; i < m; ++i) {
-                loc_values[i] = Interpolate(
-                    smoothed_slice, target_event_samples[i].time + lag, /*velocity=*/false);
+        // Same idea as the target's own entry-threshold detection in
+        // PushSample, just applied to localization and scoped to search only
+        // in [search_begin, search_end] for this specific target event --
+        // never at localization_history_'s absolute start, which could belong
+        // to an unrelated, older maneuver.
+        auto it = std::lower_bound(
+            localization_history_.begin(),
+            localization_history_.end(),
+            search_begin,
+            [](const Sample& sample, double value) { return sample.time < value; });
+        for (; it != localization_history_.end() && it->time <= search_end; ++it) {
+            if (it->acc <= localization_entry_threshold_) {
+                result.lag = it->time - begin_time;
+                result.valid = true;
+                return result;
             }
-            if (!NormalizeInPlace(loc_values)) {
-                continue; // localization is flat around this candidate -- skip it
-            }
-
-            double score = 0.0;
-            for (std::size_t i = 0; i < m; ++i) {
-                score += target_values[i] * loc_values[i];
-            }
-            score /= static_cast<double>(m);
-
-            if (score > best_score) {
-                best_score = score;
-                best_lag = lag;
-                found = true;
-            }
-        }
-
-        if (found) {
-            result.valid = true;
-            result.lag = best_lag;
-            result.confidence = best_score;
         }
         return result;
     }
 
     void BrakeCompensationBuilder::MatchAndUpdate(const PendingTargetEvent& event) {
-        const std::vector<Sample> kept(
-            event.smoothed_samples.begin(),
-            event.smoothed_samples.begin() +
-                static_cast<std::ptrdiff_t>(event.peak_index) + 1);
-
         const BrakeProfile target_profile = BuildProfileFromSamples(
-            kept, kept.front().time, kept.back().time - kept.front().time);
+            event.kept_samples,
+            event.kept_samples.front().time,
+            event.kept_samples.back().time - event.kept_samples.front().time);
         if (target_profile.phase.empty()) {
             return;
         }
 
-        const LagEstimate estimate = EstimateLag(event.smoothed_samples);
+        const LagEstimate estimate = EstimateLag(target_profile.begin_time);
 
-        // Prefer this event's own lag estimate when it's confident enough;
-        // otherwise fall back to the last learned value rather than guessing.
+        // Prefer this event's own localization entry crossing when found;
+        // otherwise fall back to the last learned lag rather than guessing.
         double lag = current_lag_;
-        double confidence = current_lag_confidence_;
         bool fresh_estimate_used = false;
-        if (estimate.valid && estimate.confidence >= min_lag_correlation_) {
+        if (estimate.valid) {
             lag = estimate.lag;
-            confidence = estimate.confidence;
             fresh_estimate_used = true;
         }
 
@@ -452,10 +379,9 @@ namespace yandex::sdc::control {
         if (fresh_estimate_used) {
             current_lag_ =
                 (1.0 - lag_update_rate_) * current_lag_ + lag_update_rate_ * lag;
-            current_lag_confidence_ = confidence;
         }
 
-        UpdateParams(target_profile, localization_profile, lag, confidence);
+        UpdateParams(target_profile, localization_profile, lag, fresh_estimate_used ? 1.0 : 0.0);
     }
 
     BrakeCompensationBuilder::BrakeProfile
@@ -730,7 +656,6 @@ namespace yandex::sdc::control {
         pending_target_events_.clear();
         current_time_ = 0.0;
         current_lag_ = 0.0;
-        current_lag_confidence_ = 0.0;
         // Per the class doc, Clear() also resets the table itself, not just the
         // in-flight event/history/lag state.
         InitParams();

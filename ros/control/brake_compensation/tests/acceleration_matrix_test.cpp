@@ -39,6 +39,32 @@ std::vector<double> BuildBrakingSignal(
     return signal;
 }
 
+constexpr double kLocalizationEntryThreshold = -0.3; // must match the default
+
+// Same ramp+release shape as BuildBrakingSignal, but starting exactly at
+// kLocalizationEntryThreshold instead of -0.2: a delayed copy's onset
+// crossing then lands exactly on its first sample, giving exact control
+// over the lag EstimateLag will find in tests (rather than the ramp's own
+// -0.2-to-threshold travel time adding an unknown offset).
+std::vector<double> BuildLocalizationSignal(
+    double peak_acc, std::size_t ramp_len, std::size_t release_len) {
+    std::vector<double> signal;
+    signal.reserve(ramp_len + release_len);
+    for (std::size_t i = 0; i < ramp_len; ++i) {
+        const double t = ramp_len > 1
+            ? static_cast<double>(i) / static_cast<double>(ramp_len - 1)
+            : 1.0;
+        signal.push_back(
+            kLocalizationEntryThreshold + t * (peak_acc - kLocalizationEntryThreshold));
+    }
+    for (std::size_t i = 0; i < release_len; ++i) {
+        const double t =
+            static_cast<double>(i + 1) / static_cast<double>(release_len);
+        signal.push_back(peak_acc + t * (0.5 - peak_acc));
+    }
+    return signal;
+}
+
 std::vector<double> ScaleSignal(const std::vector<double>& source, double scale) {
     std::vector<double> out(source.size());
     for (std::size_t i = 0; i < source.size(); ++i) {
@@ -123,8 +149,9 @@ TEST(BrakeCompensationBuilderTest, NonFiniteSamplesAreIgnored) {
 // The central new behavior: target and localization no longer need to be
 // sampled at the same absolute time. Localization observes the same
 // maneuver `delay` seconds later (and here, weaker); the builder must
-// discover that delay by itself and still recover the true amplitude
-// coefficient once it corrects for it.
+// discover that delay by itself (via localization's own entry-threshold
+// crossing) and still recover the true amplitude coefficient once it
+// corrects for it.
 TEST(BrakeCompensationBuilderTest, DelayedAndScaledEventRecoversLagAndCoefficient) {
     BrakeCompensationBuilder builder(
         /*release_threshold=*/-0.5, /*update_rate=*/1.0);
@@ -133,17 +160,17 @@ TEST(BrakeCompensationBuilderTest, DelayedAndScaledEventRecoversLagAndCoefficien
     constexpr double kTrueLag = kDelaySamples * kSamplePeriod;
     constexpr double kScale = 1.3;
 
-    const auto base = BuildBrakingSignal(/*peak_acc=*/-1.5, 60, 15);
-    const auto target = ScaleSignal(base, kScale);       // stronger, on time
-    const auto localization = DelaySignal(base, kDelaySamples); // weaker, late
+    const auto localization_base = BuildLocalizationSignal(/*peak_acc=*/-1.5, 60, 15);
+    const auto target = ScaleSignal(localization_base, kScale);       // on time
+    const auto localization = DelaySignal(localization_base, kDelaySamples); // late
 
     FeedStreams(builder, localization, target, /*speed=*/5.0);
     FeedSettleGap(builder, /*speed=*/5.0);
 
     const auto debug = builder.GetDebugInfo();
     ASSERT_TRUE(debug.has_value());
-    EXPECT_NEAR(debug->lag, kTrueLag, 0.05);
-    EXPECT_GT(debug->lag_confidence, 0.9);
+    EXPECT_NEAR(debug->lag, kTrueLag, 1e-6);
+    EXPECT_DOUBLE_EQ(debug->lag_confidence, 1.0); // a fresh crossing was found
 
     ASSERT_FALSE(debug->coef_new.empty());
     for (const double coefficient : debug->coef_new) {
@@ -158,7 +185,7 @@ TEST(BrakeCompensationBuilderTest, LagIsReEstimatedPerEventNotStuckAtFirstValue)
     BrakeCompensationBuilder builder(
         /*release_threshold=*/-0.5, /*update_rate=*/1.0);
 
-    const auto base1 = BuildBrakingSignal(/*peak_acc=*/-1.5, 60, 15);
+    const auto base1 = BuildLocalizationSignal(/*peak_acc=*/-1.5, 60, 15);
     constexpr std::size_t kDelay1 = 20; // 0.4s
     FeedStreams(
         builder, DelaySignal(base1, kDelay1), ScaleSignal(base1, 1.2), /*speed=*/5.0);
@@ -166,9 +193,9 @@ TEST(BrakeCompensationBuilderTest, LagIsReEstimatedPerEventNotStuckAtFirstValue)
 
     const auto debug1 = builder.GetDebugInfo();
     ASSERT_TRUE(debug1.has_value());
-    EXPECT_NEAR(debug1->lag, kDelay1 * kSamplePeriod, 0.05);
+    EXPECT_NEAR(debug1->lag, kDelay1 * kSamplePeriod, 1e-6);
 
-    const auto base2 = BuildBrakingSignal(/*peak_acc=*/-2.5, 60, 15);
+    const auto base2 = BuildLocalizationSignal(/*peak_acc=*/-2.5, 60, 15);
     constexpr std::size_t kDelay2 = 60; // 1.2s
     FeedStreams(
         builder, DelaySignal(base2, kDelay2), ScaleSignal(base2, 1.2), /*speed=*/5.0);
@@ -176,7 +203,37 @@ TEST(BrakeCompensationBuilderTest, LagIsReEstimatedPerEventNotStuckAtFirstValue)
 
     const auto debug2 = builder.GetDebugInfo();
     ASSERT_TRUE(debug2.has_value());
-    EXPECT_NEAR(debug2->lag, kDelay2 * kSamplePeriod, 0.05);
+    EXPECT_NEAR(debug2->lag, kDelay2 * kSamplePeriod, 1e-6);
+}
+
+// Regression test for a real observed failure: the true lag exceeds
+// max_lag_, so localization's real entry crossing is never found within the
+// search window. The event must be dropped instead of being matched against
+// whatever's in range (e.g. an unrelated, still-shallow stretch), which is
+// what used to produce a low-confidence, essentially made-up coefficient.
+TEST(BrakeCompensationBuilderTest, LocalizationCrossingBeyondMaxLagIsNotUsed) {
+    BrakeCompensationBuilder builder(
+        /*release_threshold=*/-0.5,
+        /*update_rate=*/1.0,
+        /*smoothing_window=*/5,
+        /*peak_release_margin=*/0.2,
+        /*median_window=*/5,
+        /*min_braking_duration=*/0.5,
+        /*min_lag=*/0.0,
+        /*max_lag=*/1.0); // narrow on purpose
+
+    const auto localization_base = BuildLocalizationSignal(/*peak_acc=*/-1.5, 60, 15);
+    const auto target = ScaleSignal(localization_base, 1.3);
+    constexpr std::size_t kDelaySamples = 80; // 1.6s -- beyond max_lag_ = 1.0
+    const auto localization = DelaySignal(localization_base, kDelaySamples);
+
+    FeedStreams(builder, localization, target, /*speed=*/5.0);
+    FeedSettleGap(builder, 5.0);
+
+    EXPECT_FALSE(builder.GetDebugInfo().has_value());
+    for (const double value : builder.GetParams().value_points) {
+        EXPECT_DOUBLE_EQ(value, 1.0);
+    }
 }
 
 // If localization shows no correlated signal anywhere in the search range
@@ -321,7 +378,7 @@ TEST(BrakeCompensationBuilderTest, ClearResetsTableAndLearnedLag) {
 
     // A fresh event with a different delay must be picked up on its own
     // terms, proving no localization history/lag state leaked past Clear().
-    const auto base2 = BuildBrakingSignal(/*peak_acc=*/-1.5, 60, 15);
+    const auto base2 = BuildLocalizationSignal(/*peak_acc=*/-1.5, 60, 15);
     constexpr std::size_t kDelay = 30; // 0.6s
     FeedStreams(
         builder, DelaySignal(base2, kDelay), ScaleSignal(base2, 1.2), /*speed=*/5.0);
@@ -329,7 +386,7 @@ TEST(BrakeCompensationBuilderTest, ClearResetsTableAndLearnedLag) {
 
     const auto debug = builder.GetDebugInfo();
     ASSERT_TRUE(debug.has_value());
-    EXPECT_NEAR(debug->lag, kDelay * kSamplePeriod, 0.05);
+    EXPECT_NEAR(debug->lag, kDelay * kSamplePeriod, 1e-6);
 }
 
 } // namespace
