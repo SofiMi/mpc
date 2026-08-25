@@ -403,8 +403,22 @@ namespace yandex::sdc::control {
             return;
         }
 
+        // Smooth localization the same way target already was in
+        // CompleteEvent (median prefilter, then moving average): raw history
+        // is exactly as noisy as target's raw buffer, and comparing a
+        // smoothed target against raw localization let a single noisy dip in
+        // localization (toward zero, or spiking) skew that phase point's
+        // contribution to its table cell far more than the real trend
+        // should.
+        std::vector<Sample> smoothed_localization_slice = localization_slice;
+        const std::vector<double> smoothed_localization_values =
+            SmoothAcceleration(localization_slice);
+        for (std::size_t i = 0; i < smoothed_localization_slice.size(); ++i) {
+            smoothed_localization_slice[i].acc = smoothed_localization_values[i];
+        }
+
         const BrakeProfile localization_profile = BuildProfileFromSamples(
-            localization_slice, window_begin, target_profile.duration);
+            smoothed_localization_slice, window_begin, target_profile.duration);
         if (localization_profile.phase.empty()) {
             return;
         }

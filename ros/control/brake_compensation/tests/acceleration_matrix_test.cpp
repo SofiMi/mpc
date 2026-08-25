@@ -178,6 +178,39 @@ TEST(BrakeCompensationBuilderTest, DelayedAndScaledEventRecoversLagAndCoefficien
     }
 }
 
+// Regression test for a real observed failure: target's kept samples are
+// smoothed (median + moving average) in CompleteEvent before its profile is
+// built, but the localization slice went straight into BuildProfileFromSamples
+// raw. A single-sample noise spike in localization (measurement noise, not a
+// real maneuver feature) then skewed that phase point's contribution to its
+// table cell far more than a real trend would.
+TEST(BrakeCompensationBuilderTest, NoisyLocalizationIsSmoothedBeforeMatching) {
+    BrakeCompensationBuilder builder(
+        /*release_threshold=*/-0.5, /*update_rate=*/1.0);
+
+    constexpr double kScale = 1.3;
+    const auto localization_base = BuildLocalizationSignal(/*peak_acc=*/-1.5, 60, 15);
+    const auto target = ScaleSignal(localization_base, kScale);
+
+    // Localization measurement with isolated single-sample noise spikes
+    // (toward zero) every few samples -- exactly what the median prefilter
+    // in SmoothAcceleration is meant to discard, if it's actually applied.
+    std::vector<double> localization = localization_base;
+    for (std::size_t i = 3; i < localization.size(); i += 5) {
+        localization[i] *= 0.2;
+    }
+
+    FeedStreams(builder, localization, target, /*speed=*/5.0);
+    FeedSettleGap(builder, 5.0);
+
+    const auto debug = builder.GetDebugInfo();
+    ASSERT_TRUE(debug.has_value());
+    ASSERT_FALSE(debug->coef_new.empty());
+    for (const double coefficient : debug->coef_new) {
+        EXPECT_NEAR(coefficient, kScale, 0.15);
+    }
+}
+
 // Two maneuvers with clearly different real delays (e.g. two different
 // cars, or the same car's lag simply not being a fixed constant): each
 // must be recovered on its own terms, not dragged toward the other.

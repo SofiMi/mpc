@@ -70,9 +70,15 @@ namespace yandex::sdc::control {
     //     otherwise Interpolate would clamp to (or bridge across) whatever
     //     real sample is nearest, however far away, which can be deep enough
     //     to pass a plain magnitude check despite belonging to an unrelated
-    //     moment. A covered window is then still sanity-checked (it must dip
-    //     to release_threshold_ or below) before the pair is used, so a bad
-    //     match cannot corrupt the table.
+    //     moment. A covered window is smoothed the same way target's own kept
+    //     samples were in CompleteEvent (median prefilter, then moving
+    //     average) before its profile is built -- raw localization history is
+    //     exactly as noisy as target's raw buffer, and comparing a smoothed
+    //     target against raw localization let a single noisy dip skew that
+    //     phase point's contribution to its table cell. The smoothed window is
+    //     then still sanity-checked (it must dip to release_threshold_ or
+    //     below) before the pair is used, so a bad match cannot corrupt the
+    //     table.
     //   * Because the localization profile is always built over a window whose
     //     length equals the target profile's, there is no independent
     //     localization duration to mismatch, and no separate profile queue to
