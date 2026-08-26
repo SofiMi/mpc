@@ -4,6 +4,7 @@
 // of the production tree. Adjust this include to wherever that type lives.
 #include "sdg/sdc/ros/control/steering_mpc/rover_state.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <optional>
@@ -11,30 +12,39 @@
 
 namespace yandex::sdc::control::steering_mpc {
 
-    // Validates an MPC steering plan against the vehicle's kinematic comfort /
-    // safety envelope before it is published. Two independent checks:
+    // Validates an MPC steering plan against the vehicle's kinematic envelope
+    // before it is published. Both checks invert the same speed-dependent
+    // constraints the planner builds from max_kinematic_normal_acceleration /
+    // max_kinematic_normal_jerk, so a plan that satisfies them here is exactly
+    // one the constraint builder would have admitted:
     //
-    //   a) Normal (centripetal) acceleration of the vehicle (ВАТС) evaluated on
-    //      the kinematic model from the resulting states:
-    //          a_n = v^2 * tan(fwsa) / L,   v = hypot(velocity_x, velocity_y)
-    //      taken from each RoverState in `results`. Must not exceed
-    //      max_normal_acceleration in magnitude at any planned step.
+    //   a) Normal (centripetal) acceleration, from fwsa in the resulting states
+    //      (max_abs_fwsa = atan(a_n * L / v^2) * slip inverted):
+    //          a_n = v^2 * tan(fwsa / slip) / L
+    //      with v = hypot(velocity_x, velocity_y), L = GetWheelBase(),
+    //      slip = SlipCorrection(v). Must not exceed max_normal_acceleration.
     //
-    //   b) Normal jerk, the time derivative of the normal acceleration from a):
-    //          jerk_n[i] = (a_n(results[i + 1]) - a_n(results[i])) / time_step
-    //      Must not exceed max_normal_jerk in magnitude on any step.
+    //   b) Normal jerk, from the steering-rate controls (fwsa_rate)
+    //      (max_fwsa_rate = jerk * (L / v^2) * slip inverted):
+    //          jerk_n = v^2 * fwsa_rate / (L * slip)
+    //      with the speed taken from the state the control applies at. Must not
+    //      exceed max_normal_jerk.
     //
-    // IsPlanAdmissible() returns true when BOTH constraints hold everywhere, so
-    // the caller can skip the trajectory when it returns false. `controls` is
-    // accepted alongside `results` for a uniform plan interface; the checks
-    // above are derived from the resulting states.
+    // At v == 0 both values are 0 (the v^2 factor), so a standing plan is always
+    // admissible and SlipCorrection is not queried.
+    //
+    // IsPlanAdmissible() returns true when both constraints hold everywhere, so
+    // the caller can skip the trajectory when it returns false.
+    //
+    // Templated on the steering model to stay header-only and unit-testable; the
+    // model only needs `double GetWheelBase() const` and
+    // `double SlipCorrection(double speed) const`.
+    template <typename SteeringModel>
     class MpcPlanConstraintChecker {
     public:
         struct Limits {
             double max_normal_acceleration = 0.0; // m/s^2, > 0
             double max_normal_jerk = 0.0;         // m/s^3, > 0
-            double wheelbase = 0.0;               // L, meters, > 0
-            double time_step = 0.0;               // dt between plan points, s, > 0
         };
 
         struct Violation {
@@ -44,21 +54,37 @@ namespace yandex::sdc::control::steering_mpc {
             };
 
             Kind kind = Kind::NormalAcceleration;
-            std::size_t index = 0; // plan step (state index / control index)
+            std::size_t index = 0; // offending step (state index / control index)
             double value = 0.0;    // signed offending value
             double limit = 0.0;    // limit it exceeded (positive)
         };
 
-        explicit MpcPlanConstraintChecker(Limits limits) noexcept
-            : limits_(limits)
+        MpcPlanConstraintChecker(const SteeringModel& steering_model, Limits limits) noexcept
+            : steering_model_(steering_model)
+            , limits_(limits)
         {
         }
 
         // Kinematic normal (centripetal) acceleration of a single planned state,
-        // derived from its steering angle (fwsa): a_n = v^2 * tan(fwsa) / L.
+        // from its steering angle: a_n = v^2 * tan(fwsa / slip) / L.
         [[nodiscard]] double NormalAcceleration(const RoverState& state) const noexcept {
             const double speed = std::hypot(state.velocity_x, state.velocity_y);
-            return speed * speed * std::tan(state.fwsa) / limits_.wheelbase;
+            if (speed <= 0.0) {
+                return 0.0;
+            }
+            const double slip = steering_model_.SlipCorrection(speed);
+            return speed * speed * std::tan(state.fwsa / slip) / steering_model_.GetWheelBase();
+        }
+
+        // Kinematic normal jerk implied by a steering-rate control at the given
+        // state: jerk_n = v^2 * fwsa_rate / (L * slip).
+        [[nodiscard]] double NormalJerk(const RoverState& state, double fwsa_rate) const noexcept {
+            const double speed = std::hypot(state.velocity_x, state.velocity_y);
+            if (speed <= 0.0) {
+                return 0.0;
+            }
+            const double slip = steering_model_.SlipCorrection(speed);
+            return speed * speed * fwsa_rate / (steering_model_.GetWheelBase() * slip);
         }
 
         // true  -> plan is admissible, publish it.
@@ -73,7 +99,7 @@ namespace yandex::sdc::control::steering_mpc {
         // normal jerk). Handy for diagnostics / logging why a plan was skipped.
         [[nodiscard]] std::optional<Violation> FindViolation(
             const std::vector<RoverState>& results,
-            [[maybe_unused]] const std::vector<double>& controls) const noexcept {
+            const std::vector<double>& controls) const noexcept {
             // a) Normal acceleration by fwsa from the resulting states.
             for (std::size_t i = 0; i < results.size(); ++i) {
                 const double a_n = NormalAcceleration(results[i]);
@@ -87,11 +113,11 @@ namespace yandex::sdc::control::steering_mpc {
                 }
             }
 
-            // b) Normal jerk: time derivative of the normal acceleration above.
-            for (std::size_t i = 0; i + 1 < results.size(); ++i) {
-                const double jerk =
-                    (NormalAcceleration(results[i + 1]) - NormalAcceleration(results[i])) /
-                    limits_.time_step;
+            // b) Normal jerk from the steering-rate controls; each control
+            // applies at the state with the same index.
+            const std::size_t jerk_steps = std::min(controls.size(), results.size());
+            for (std::size_t i = 0; i < jerk_steps; ++i) {
+                const double jerk = NormalJerk(results[i], controls[i]);
                 if (std::abs(jerk) > limits_.max_normal_jerk) {
                     return Violation{
                         .kind = Violation::Kind::NormalJerk,
@@ -106,6 +132,7 @@ namespace yandex::sdc::control::steering_mpc {
         }
 
     private:
+        const SteeringModel& steering_model_;
         const Limits limits_;
     };
 
