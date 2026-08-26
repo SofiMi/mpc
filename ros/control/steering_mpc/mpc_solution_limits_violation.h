@@ -63,4 +63,35 @@ namespace yandex::sdc::control::steering_mpc {
             MaxLimitViolation(items, final_visitor, limit, ignore_first));
     }
 
+    // Max limit violation over two parallel sequences combined element-wise by
+    // a binary visitor -- e.g. a state and its control (fwsa_velocity), where
+    // the limited quantity (normal jerk) needs both. Iterates min(size) pairs;
+    // `ignore_first` drops the leading pair.
+    template <std::ranges::input_range RangeA,
+              std::ranges::input_range RangeB,
+              typename BinaryVisitor>
+        requires std::invocable<BinaryVisitor,
+                                const std::ranges::range_value_t<RangeA>&,
+                                const std::ranges::range_value_t<RangeB>&>
+    double MaxLimitViolationZip(
+        const RangeA& a,
+        const RangeB& b,
+        const BinaryVisitor& visitor,
+        double limit,
+        bool ignore_first = false) {
+        double max_value = 0.0;
+        auto ia = std::ranges::begin(a);
+        auto ib = std::ranges::begin(b);
+        const auto ea = std::ranges::end(a);
+        const auto eb = std::ranges::end(b);
+        if (ignore_first) {
+            if (ia != ea) { ++ia; }
+            if (ib != eb) { ++ib; }
+        }
+        for (; ia != ea && ib != eb; ++ia, ++ib) {
+            max_value = std::max(max_value, std::abs(visitor(*ia, *ib)));
+        }
+        return LimitViolation(max_value, limit);
+    }
+
 } // namespace yandex::sdc::control::steering_mpc
