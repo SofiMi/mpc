@@ -3,8 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <concepts>
-#include <cstddef>
-#include <vector>
+#include <ranges>
 
 namespace yandex::sdc::control::steering_mpc {
 
@@ -13,47 +12,48 @@ namespace yandex::sdc::control::steering_mpc {
         return std::max(0.0, value - limit);
     }
 
-    // Largest |visitor(item)| over the container. `ignore_first` skips the
-    // leading element (used for transitions whose first entry is the seam with
-    // the previous solution and must not count). Generic over both the element
-    // type and the visitor, so one definition serves states and transitions.
-    template <typename Item, typename Visitor>
-        requires std::invocable<Visitor, const Item&>
+    // Largest |visitor(item)| over the sequence. `ignore_first` skips the
+    // leading element (a transition/seam that must not count). Generic over the
+    // container (std::vector, std::span, ...), the element type, and the
+    // visitor, so one definition serves every limited quantity.
+    template <std::ranges::input_range Range, typename Visitor>
+        requires std::invocable<Visitor, const std::ranges::range_value_t<Range>&>
     double MaxAbsoluteValue(
-        const std::vector<Item>& items,
+        const Range& items,
         const Visitor& visitor,
         bool ignore_first = false) {
         double max_value = 0.0;
-        const std::size_t begin = ignore_first && !items.empty() ? 1 : 0;
-        for (std::size_t i = begin; i < items.size(); ++i) {
-            max_value = std::max(max_value, std::abs(visitor(items[i])));
+        auto it = std::ranges::begin(items);
+        const auto end = std::ranges::end(items);
+        if (ignore_first && it != end) {
+            ++it;
+        }
+        for (; it != end; ++it) {
+            max_value = std::max(max_value, std::abs(visitor(*it)));
         }
         return max_value;
     }
 
     // Max amount by which the visited quantity breaks `limit` across the
-    // container, or 0.0 if it never does. Replaces the per-container overloads:
-    // works for a vector of any element type (states, transitions, ...) and any
-    // visitor, with the optional `ignore_first` seam skip.
-    template <typename Item, typename Visitor>
-        requires std::invocable<Visitor, const Item&>
+    // sequence, or 0.0 if it never does.
+    template <std::ranges::input_range Range, typename Visitor>
+        requires std::invocable<Visitor, const std::ranges::range_value_t<Range>&>
     double MaxLimitViolation(
-        const std::vector<Item>& items,
+        const Range& items,
         const Visitor& visitor,
         double limit,
         bool ignore_first = false) {
         return LimitViolation(MaxAbsoluteValue(items, visitor, ignore_first), limit);
     }
 
-    // Same, but the quantity is limited at two endpoints of each element (a
-    // transition's start and final): the reported violation is the worse of the
-    // two. The two-visitor arity keeps this unambiguous with the single-visitor
-    // overload above.
-    template <typename Item, typename StartVisitor, typename FinalVisitor>
-        requires std::invocable<StartVisitor, const Item&> &&
-                 std::invocable<FinalVisitor, const Item&>
+    // Same, but the quantity is limited at two endpoints of each element: the
+    // reported violation is the worse of the two. The two-visitor arity keeps
+    // this unambiguous with the single-visitor overload above.
+    template <std::ranges::input_range Range, typename StartVisitor, typename FinalVisitor>
+        requires std::invocable<StartVisitor, const std::ranges::range_value_t<Range>&> &&
+                 std::invocable<FinalVisitor, const std::ranges::range_value_t<Range>&>
     double MaxLimitViolation(
-        const std::vector<Item>& items,
+        const Range& items,
         const StartVisitor& start_visitor,
         const FinalVisitor& final_visitor,
         double limit,
