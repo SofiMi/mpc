@@ -104,7 +104,9 @@ namespace yandex::sdc::control {
         }
         const std::size_t value_count =
             params_.speed_points.size() * params_.acceleration_points.size();
-        params_.value_points.assign(value_count, 1.0);
+        // Identity delta: no compensation until a cell is actually observed
+        // (or a neighbor propagates into it).
+        params_.value_points.assign(value_count, 0.0);
         params_.enable = true;
         update_counts_.assign(value_count, 0.0);
     }
@@ -624,49 +626,66 @@ namespace yandex::sdc::control {
             cell.vel = speed;
         }
 
-        // Один шаг EMA на ячейку от схлопнутого коэффициента.
+        // Один шаг EMA на ячейку, в пространстве отношений (см. комментарий в
+        // заголовке класса): текущая дельта ячейки сначала переводится в
+        // отношение относительно её узла сетки, чтобы восстановить, каким
+        // был реально исполненный (уже скомпенсированный) таргет, и именно
+        // его -- а не сырой таргет -- сравнить с локализацией.
         for (const auto& [value_index, cell] : per_cell) {
             if (cell.localization <= kEpsilon) {
                 continue;
             }
-            const double coefficient = cell.target / cell.localization;
-            if (!IsFinite(coefficient) || coefficient <= 0.0) {
+            const std::size_t acceleration_index = value_index / n_speed;
+            const std::size_t speed_index = value_index % n_speed;
+            const double acc_grid = params_.acceleration_points[acceleration_index];
+            if (std::abs(acc_grid) <= kEpsilon) {
                 continue;
             }
+
+            const double delta_old = params_.value_points[value_index];
+            const double coefficient_old = (acc_grid + delta_old) / acc_grid;
+            const double corrected_target = coefficient_old * cell.target;
+            const double coefficient_new = corrected_target / cell.localization;
+            if (!IsFinite(coefficient_new)) {
+                continue;
+            }
+
             double& count = update_counts_[value_index];
             count += 1.0;
-            const double rate = update_rate_;
-            const double old_value = params_.value_points[value_index];
-            params_.value_points[value_index] = std::clamp((1.0 - rate) * old_value + rate * coefficient, 1.0, 1.5);
+            const double coefficient_res =
+                UpdateCellDelta(value_index, coefficient_new, update_rate_);
 
             vel.push_back(cell.vel);
             acc.push_back(cell.acc);
-            coef_old.push_back(old_value);
-            coef_new.push_back(coefficient);
-            coef_res.push_back(params_.value_points[value_index]);
+            coef_old.push_back(coefficient_old);
+            coef_new.push_back(coefficient_new);
+            coef_res.push_back(coefficient_res);
 
             // A cell no phase point ever lands on exactly would otherwise stay
-            // at 1.0 forever, however well its neighbors are calibrated. Nudge
-            // the orthogonal grid neighbors toward the same observed
-            // coefficient too, with a separate (smaller) rate.
+            // at its identity delta (0.0) forever, however well its neighbors
+            // are calibrated. Nudge the orthogonal grid neighbors toward the
+            // same freshly observed coefficient too, with a separate
+            // (smaller) rate.
             if (neighbor_update_rate_ > 0.0) {
-                const std::size_t acceleration_index = value_index / n_speed;
-                const std::size_t speed_index = value_index % n_speed;
                 if (acceleration_index > 0) {
-                    UpdateNeighborCell(
-                        (acceleration_index - 1) * n_speed + speed_index, coefficient);
+                    UpdateCellDelta(
+                        (acceleration_index - 1) * n_speed + speed_index,
+                        coefficient_new, neighbor_update_rate_);
                 }
                 if (acceleration_index + 1 < params_.acceleration_points.size()) {
-                    UpdateNeighborCell(
-                        (acceleration_index + 1) * n_speed + speed_index, coefficient);
+                    UpdateCellDelta(
+                        (acceleration_index + 1) * n_speed + speed_index,
+                        coefficient_new, neighbor_update_rate_);
                 }
                 if (speed_index > 0) {
-                    UpdateNeighborCell(
-                        acceleration_index * n_speed + (speed_index - 1), coefficient);
+                    UpdateCellDelta(
+                        acceleration_index * n_speed + (speed_index - 1),
+                        coefficient_new, neighbor_update_rate_);
                 }
                 if (speed_index + 1 < n_speed) {
-                    UpdateNeighborCell(
-                        acceleration_index * n_speed + (speed_index + 1), coefficient);
+                    UpdateCellDelta(
+                        acceleration_index * n_speed + (speed_index + 1),
+                        coefficient_new, neighbor_update_rate_);
                 }
             }
         }
@@ -684,16 +703,35 @@ namespace yandex::sdc::control {
         }
     }
 
-    void BrakeCompensationBuilder::UpdateNeighborCell(
-        std::size_t value_index, double coefficient) {
-        if (value_index >= params_.value_points.size()) {
-            return;
+    double BrakeCompensationBuilder::UpdateCellDelta(
+        std::size_t value_index, double coefficient_new, double rate) {
+        if (value_index >= params_.value_points.size() || rate <= 0.0) {
+            return 1.0;
         }
-        const double old_value = params_.value_points[value_index];
-        params_.value_points[value_index] = std::clamp(
-            (1.0 - neighbor_update_rate_) * old_value +
-                neighbor_update_rate_ * coefficient,
-            1.0, 1.5);
+        const std::size_t n_speed = params_.speed_points.size();
+        const std::size_t acceleration_index = value_index / n_speed;
+        const double acc_grid = params_.acceleration_points[acceleration_index];
+        if (std::abs(acc_grid) <= kEpsilon) {
+            return 1.0;
+        }
+
+        const double delta_old = params_.value_points[value_index];
+        const double coefficient_old = (acc_grid + delta_old) / acc_grid;
+        const double coefficient_res =
+            (1.0 - rate) * coefficient_old + rate * coefficient_new;
+
+        // Same physical envelope a pure ratio table would have had -- never
+        // reduce compensation below identity, never exceed a 1.5x multiplier
+        // -- re-derived per cell from its own grid acceleration, since
+        // acc_grid < 0 makes [1.0, 1.5] in ratio space equal to
+        // [0.5 * acc_grid, 0.0] in delta space.
+        double delta_new = coefficient_res * acc_grid - acc_grid;
+        const double delta_min = std::min(0.5 * acc_grid, 0.0);
+        const double delta_max = std::max(0.5 * acc_grid, 0.0);
+        delta_new = std::clamp(delta_new, delta_min, delta_max);
+        params_.value_points[value_index] = delta_new;
+
+        return (acc_grid + delta_new) / acc_grid;
     }
 
     void BrakeCompensationBuilder::Clear() {

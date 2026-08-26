@@ -13,10 +13,16 @@ namespace yandex::sdc::control {
     // Compensation table produced by BrakeCompensationBuilder.
     //
     // The table is a 2D grid keyed by (speed, acceleration). `value_points` stores
-    // the multiplicative compensation coefficients in row-major order with the
-    // acceleration index as the row and the speed index as the column:
+    // additive acceleration compensation deltas (m/s^2, usually <= 0) in row-major
+    // order with the acceleration index as the row and the speed index as the
+    // column:
     //
     //     value_points[acc_index * speed_points.size() + speed_index]
+    //
+    // For a target acceleration near grid point `acceleration_points[acc_index]`,
+    // the compensated command is `target + value_points[...]`: brake harder by
+    // that much to make up for a weak brake. A cell never touched by a real
+    // observation stays at its identity value, 0.0 (no compensation).
     //
     // The public shape of this struct (fields + BuildInterpolant) is part of the
     // external API and must stay stable.
@@ -73,19 +79,41 @@ namespace yandex::sdc::control {
     //     window ends at -- localization_history_ already covers the whole
     //     window by the time the event completes. Matching happens
     //     synchronously right there: no waiting, no pending-event queue.
-    //   * Each profile is resampled onto a fixed phase grid; per-segment we take
-    //     the absolute integral of acceleration. The per-segment coefficient is
-    //     target_delta_I / localization_delta_I.
-    //   * Coefficients are folded into the table with an exponential moving average
-    //     (update_rate_), so recent maneuvers matter more than old ones.
+    //   * Each profile is resampled onto a fixed phase grid; per matched phase
+    //     point, target and localization acceleration are summed (per cell) as
+    //     a time-normalized proxy for their integrals over the window.
+    //   * The table stores an additive delta per (speed, acceleration) cell, but
+    //     the actual update is done in ratio space, matching what a maneuver
+    //     "means" physically: cell.acc_grid is the cell's grid acceleration and
+    //     delta_old the currently stored delta, so (acc_grid + delta_old) /
+    //     acc_grid is the multiplier the table currently implies at that exact
+    //     point. Since that delta was presumably already applied when this
+    //     maneuver's command was issued, multiplying it back onto the observed
+    //     (raw) target sum recovers an estimate of the actually executed
+    //     command -- which, not the raw uncorrected target, is what belongs in
+    //     the numerator when comparing against localization:
+    //
+    //         coefficient_old = (acc_grid + delta_old) / acc_grid
+    //         coefficient_new = coefficient_old * target_sum / localization_sum
+    //
+    //     coefficient_new is folded in via an exponential moving average in
+    //     ratio space (update_rate_, default weight 0.2 to the new observation,
+    //     0.8 to the ratio the old delta implied), then converted back to a
+    //     delta and clamped to keep the same physical envelope as a pure ratio
+    //     table would (never reduce compensation below identity, never exceed
+    //     what a 1.5x multiplier would have given at that grid point):
+    //
+    //         coefficient_res = clamp(0.8 * coefficient_old + 0.2 * coefficient_new)
+    //         delta_new = coefficient_res * acc_grid - acc_grid
+    //
     //   * A cell that no phase point ever lands on exactly would otherwise stay
-    //     at 1.0 forever, even once its neighbors are well calibrated. Each
-    //     directly observed cell also nudges its orthogonal grid neighbors (one
-    //     step along the acceleration axis, one step along the speed axis)
-    //     toward the same observed coefficient, with a separate, smaller
-    //     (neighbor_update_rate_) rate -- so calibration diffuses across the
-    //     grid instead of staying pinned to only the cells phase points happen
-    //     to hit.
+    //     at its identity delta (0.0) forever, even once its neighbors are well
+    //     calibrated. Each directly observed cell also nudges its orthogonal
+    //     grid neighbors (one step along the acceleration axis, one step along
+    //     the speed axis) the same way, reusing that maneuver's coefficient_new
+    //     but blended in at a separate, smaller (neighbor_update_rate_) rate --
+    //     so calibration diffuses across the grid instead of staying pinned to
+    //     only the cells phase points happen to hit.
     class BrakeCompensationBuilder {
     public:
         explicit BrakeCompensationBuilder(
@@ -221,9 +249,14 @@ namespace yandex::sdc::control {
             const BrakeProfile& target_profile,
             const BrakeProfile& localization_profile);
 
-        // Nudge one grid cell toward `coefficient` with neighbor_update_rate_
-        // (a no-op if `value_index` is out of range).
-        void UpdateNeighborCell(std::size_t value_index, double coefficient);
+        // Blend `coefficient_new` into one grid cell's stored delta at `rate`
+        // (see class doc for the ratio<->delta conversion), clamp, store, and
+        // return the resulting (post-clamp) ratio-space coefficient -- used
+        // both for the directly observed cell (rate = update_rate_) and for
+        // each of its neighbors (rate = neighbor_update_rate_). A no-op
+        // (returns 1.0) if `value_index` is out of range or `rate` is zero.
+        double UpdateCellDelta(
+            std::size_t value_index, double coefficient_new, double rate);
 
         std::size_t FindNearestSpeedIndex(double speed) const;
         std::size_t FindNearestAccelerationIndex(double acceleration) const;

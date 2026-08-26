@@ -44,6 +44,23 @@ std::vector<double> NeutralSignal(std::size_t length) {
     return std::vector<double>(length, 0.0);
 }
 
+// The table stores an additive delta per cell; this recovers the ratio-space
+// coefficient equivalent -- (acc_grid + delta) / acc_grid -- that the class
+// doc's EMA formula operates on, for assertions that are easier to reason
+// about as a multiplier than as a raw delta. The grid's last acceleration
+// point is 0.0 (see BrakeCompensationBuilder::InitParams), where that ratio
+// is undefined; the class itself never touches that cell (guarded the same
+// way), so it's always identity here too.
+double CoefficientAt(const BrakeCompensationParams& params, std::size_t value_index) {
+    const std::size_t n_speed = params.speed_points.size();
+    const std::size_t acceleration_index = value_index / n_speed;
+    const double acc_grid = params.acceleration_points[acceleration_index];
+    if (std::abs(acc_grid) < 1e-9) {
+        return 1.0;
+    }
+    return (acc_grid + params.value_points[value_index]) / acc_grid;
+}
+
 // Feeds two independently-sized streams through the builder, one sample per
 // Set() call, at a constant speed; the shorter stream is padded with
 // neutral (0.0) samples.
@@ -60,7 +77,7 @@ void FeedStreams(
     }
 }
 
-TEST(BrakeCompensationBuilderTest, InitialTableIsAllOnes) {
+TEST(BrakeCompensationBuilderTest, InitialTableIsAllZeros) {
     BrakeCompensationBuilder builder(/*release_threshold=*/-0.5);
     const BrakeCompensationParams params = builder.GetParams();
 
@@ -69,7 +86,7 @@ TEST(BrakeCompensationBuilderTest, InitialTableIsAllOnes) {
     ASSERT_EQ(params.acceleration_points.size(), 9u);
     ASSERT_EQ(params.value_points.size(), 11u * 9u);
     for (const double value : params.value_points) {
-        EXPECT_DOUBLE_EQ(value, 1.0);
+        EXPECT_DOUBLE_EQ(value, 0.0);
     }
 }
 
@@ -80,7 +97,7 @@ TEST(BrakeCompensationBuilderTest, NeutralDrivingNeverUpdatesTable) {
             /*localization_acc=*/0.0, /*target_acc=*/0.0, /*localization_vel=*/5.0);
     }
     for (const double value : builder.GetParams().value_points) {
-        EXPECT_DOUBLE_EQ(value, 1.0);
+        EXPECT_DOUBLE_EQ(value, 0.0);
     }
     EXPECT_FALSE(builder.GetDebugInfo().has_value());
 }
@@ -92,7 +109,7 @@ TEST(BrakeCompensationBuilderTest, NonFiniteSamplesAreIgnored) {
         builder.Set(nan_value, nan_value, nan_value);
     }
     for (const double value : builder.GetParams().value_points) {
-        EXPECT_DOUBLE_EQ(value, 1.0);
+        EXPECT_DOUBLE_EQ(value, 0.0);
     }
     EXPECT_FALSE(builder.GetDebugInfo().has_value());
 }
@@ -203,7 +220,7 @@ TEST(BrakeCompensationBuilderTest, GapDuringEventIsRejectedNotClampedIntoAMatch)
 
     EXPECT_FALSE(builder.GetDebugInfo().has_value());
     for (const double value : builder.GetParams().value_points) {
-        EXPECT_DOUBLE_EQ(value, 1.0);
+        EXPECT_DOUBLE_EQ(value, 0.0);
     }
 }
 
@@ -218,7 +235,7 @@ TEST(BrakeCompensationBuilderTest, EventWithNoLocalizationSignalIsDropped) {
 
     EXPECT_FALSE(builder.GetDebugInfo().has_value());
     for (const double value : builder.GetParams().value_points) {
-        EXPECT_DOUBLE_EQ(value, 1.0);
+        EXPECT_DOUBLE_EQ(value, 0.0);
     }
 }
 
@@ -271,24 +288,28 @@ TEST(BrakeCompensationBuilderTest, CoefficientAboveMaxIsClamped) {
 
     FeedStreams(builder, base, target, /*speed=*/5.0);
 
-    // Every cell (primary or neighbor-nudged) must stay within [1.0, 1.5],
-    // and a directly observed cell -- whose raw coefficient is far above the
-    // ceiling -- must land exactly on it.
+    // Every cell (primary or neighbor-nudged), read back as a ratio-space
+    // coefficient, must stay within [1.0, 1.5], and a directly observed cell
+    // -- whose raw coefficient is far above the ceiling -- must land exactly
+    // on it.
+    const BrakeCompensationParams params = builder.GetParams();
     bool any_at_max = false;
-    for (const double value : builder.GetParams().value_points) {
-        ASSERT_GE(value, 1.0);
-        ASSERT_LE(value, 1.5);
-        if (value > 1.5 - 1e-6) {
+    for (std::size_t i = 0; i < params.value_points.size(); ++i) {
+        const double coefficient = CoefficientAt(params, i);
+        ASSERT_GE(coefficient, 1.0 - 1e-9);
+        ASSERT_LE(coefficient, 1.5 + 1e-9);
+        if (coefficient > 1.5 - 1e-6) {
             any_at_max = true;
         }
     }
     EXPECT_TRUE(any_at_max);
 }
 
-// A cell no phase point ever lands on exactly would otherwise stay at 1.0
-// forever, however well-calibrated its neighbors are. Directly observed
-// cells must also nudge their orthogonal grid neighbors toward the same
-// coefficient, at a smaller rate, so calibration diffuses across the grid.
+// A cell no phase point ever lands on exactly would otherwise stay at its
+// identity delta (0.0) forever, however well-calibrated its neighbors are.
+// Directly observed cells must also nudge their orthogonal grid neighbors
+// toward the same coefficient, at a smaller rate, so calibration diffuses
+// across the grid.
 TEST(BrakeCompensationBuilderTest, NeighboringCellsGetASmallerUpdateToo) {
     BrakeCompensationBuilder builder(
         /*release_threshold=*/-0.5, /*update_rate=*/1.0);
@@ -306,11 +327,13 @@ TEST(BrakeCompensationBuilderTest, NeighboringCellsGetASmallerUpdateToo) {
     const std::size_t directly_touched = debug->coef_new.size();
     ASSERT_GT(directly_touched, 0u);
 
+    const BrakeCompensationParams params = builder.GetParams();
     std::size_t moved_cells = 0;
-    for (const double value : builder.GetParams().value_points) {
-        ASSERT_GE(value, 1.0);
-        ASSERT_LE(value, 1.5);
-        if (value > 1.0) {
+    for (std::size_t i = 0; i < params.value_points.size(); ++i) {
+        const double coefficient = CoefficientAt(params, i);
+        ASSERT_GE(coefficient, 1.0 - 1e-9);
+        ASSERT_LE(coefficient, 1.5 + 1e-9);
+        if (params.value_points[i] != 0.0) {
             ++moved_cells;
         }
     }
@@ -320,7 +343,17 @@ TEST(BrakeCompensationBuilderTest, NeighboringCellsGetASmallerUpdateToo) {
     EXPECT_GT(moved_cells, directly_touched);
 }
 
-TEST(BrakeCompensationBuilderTest, RepeatedEventsConvergeViaExponentialMovingAverage) {
+// Unlike the old multiplicative EMA (which converged to and stayed at the
+// observed ratio, e.g. 1.3), the new formula folds the currently stored
+// delta back into the numerator each time (coefficient_new = coefficient_old
+// * target_sum / localization_sum, per the agreed spec), so replaying the
+// *same* persistent mismatch over and over has no stable point below the
+// clamp: each round's coefficient_old gets multiplied by the same >1 raw
+// ratio again. That's expected for this kind of offline replay (a live
+// vehicle's localization would itself shift as larger compensation was
+// actually applied) -- so this now checks monotonic convergence up to the
+// clamp ceiling, not to the raw observed ratio.
+TEST(BrakeCompensationBuilderTest, RepeatedIdenticalMismatchConvergesToClamp) {
     BrakeCompensationBuilder builder(
         /*release_threshold=*/-0.5, /*update_rate=*/0.2);
 
@@ -328,26 +361,27 @@ TEST(BrakeCompensationBuilderTest, RepeatedEventsConvergeViaExponentialMovingAve
     const auto target = ScaleSignal(base, 1.3);
 
     double previous_max = 1.0;
-    for (int repeat = 0; repeat < 10; ++repeat) {
+    for (int repeat = 0; repeat < 30; ++repeat) {
         FeedStreams(builder, base, target, /*speed=*/5.0);
         // A neutral gap so the next repeat's -0.2 crossing starts a fresh
         // event rather than continuing the tail of the release ramp.
         FeedStreams(builder, NeutralSignal(20), NeutralSignal(20), 5.0);
 
+        const BrakeCompensationParams params = builder.GetParams();
         double current_max = 1.0;
-        for (const double value : builder.GetParams().value_points) {
-            current_max = std::max(current_max, value);
+        for (std::size_t i = 0; i < params.value_points.size(); ++i) {
+            current_max = std::max(current_max, CoefficientAt(params, i));
         }
         EXPECT_GE(current_max, previous_max - 1e-9);
         previous_max = current_max;
     }
 
-    EXPECT_NEAR(previous_max, 1.3, 0.05);
+    EXPECT_NEAR(previous_max, 1.5, 0.01);
 }
 
 // Regression test for: Clear() is documented to drop all in-flight state and
 // reset the table, but used to only clear the event/queue state.
-TEST(BrakeCompensationBuilderTest, ClearResetsTableToInitialAllOnesGrid) {
+TEST(BrakeCompensationBuilderTest, ClearResetsTableToInitialAllZerosGrid) {
     BrakeCompensationBuilder builder(
         /*release_threshold=*/-0.5, /*update_rate=*/1.0);
 
@@ -356,7 +390,7 @@ TEST(BrakeCompensationBuilderTest, ClearResetsTableToInitialAllOnesGrid) {
 
     bool any_updated = false;
     for (const double value : builder.GetParams().value_points) {
-        any_updated = any_updated || value > 1.0;
+        any_updated = any_updated || value != 0.0;
     }
     ASSERT_TRUE(any_updated);
 
@@ -365,7 +399,7 @@ TEST(BrakeCompensationBuilderTest, ClearResetsTableToInitialAllOnesGrid) {
     const BrakeCompensationParams params = builder.GetParams();
     EXPECT_TRUE(params.enable);
     for (const double value : params.value_points) {
-        EXPECT_DOUBLE_EQ(value, 1.0);
+        EXPECT_DOUBLE_EQ(value, 0.0);
     }
 
     // A fresh event afterwards must be picked up normally, proving no
