@@ -115,12 +115,19 @@ namespace yandex::sdc::control {
     //
     //   * A cell that no phase point ever lands on exactly would otherwise stay
     //     at its identity delta (0.0) forever, even once its neighbors are well
-    //     calibrated. Each directly observed cell also nudges its orthogonal
-    //     grid neighbors (one step along the acceleration axis, one step along
-    //     the speed axis) the same way, reusing that maneuver's coefficient_new
-    //     but blended in at a separate, smaller (neighbor_update_rate_) rate --
-    //     so calibration diffuses across the grid instead of staying pinned to
-    //     only the cells phase points happen to hit.
+    //     calibrated. Each directly observed cell also propagates that
+    //     maneuver's coefficient_new to every other cell within
+    //     neighbor_kernel_radius_ grid steps (index distance, on both axes
+    //     independently -- so the window is a (2R+1) x (2R+1) square,
+    //     including diagonals), the same way but at a smaller rate that
+    //     falls off with distance: a Gaussian in grid-index distance,
+    //     weight = exp(-(delta_acc_index^2 + delta_speed_index^2) /
+    //     (2 * sigma^2)), sigma = radius / 2, times the base
+    //     neighbor_update_rate_. This decays smoothly to (effectively) zero
+    //     at the window's edge rather than cutting off sharply, so
+    //     calibration diffuses across the grid instead of staying pinned to
+    //     only the cells phase points happen to hit, without a handful of
+    //     immediate neighbors dominating a broad window's total effect.
     class BrakeCompensationBuilder {
     public:
         explicit BrakeCompensationBuilder(
@@ -132,7 +139,8 @@ namespace yandex::sdc::control {
             double min_braking_duration = 0.5,
             double sync_threshold = -0.3,
             double neighbor_update_rate = 0.05,
-            bool correct_target_for_applied_delta = true);
+            bool correct_target_for_applied_delta = true,
+            int neighbor_kernel_radius = 3);
 
         // Feed one synchronized measurement. `localization_vel` is the current
         // speed, used both as the profile speed and as the table's speed key.
@@ -286,6 +294,7 @@ namespace yandex::sdc::control {
         double sync_threshold_; // stored negative; see class doc
         double neighbor_update_rate_;
         bool correct_target_for_applied_delta_;
+        int neighbor_kernel_radius_;
     };
 
 } // namespace yandex::sdc::control

@@ -72,7 +72,8 @@ namespace yandex::sdc::control {
         double min_braking_duration,
         double sync_threshold,
         double neighbor_update_rate,
-        bool correct_target_for_applied_delta)
+        bool correct_target_for_applied_delta,
+        int neighbor_kernel_radius)
         : release_threshold_(release_threshold)
         , update_rate_(Clamp(update_rate, 0.0, 1.0))
         , smoothing_half_(smoothing_window > 1 ? smoothing_window / 2 : 0)
@@ -81,7 +82,8 @@ namespace yandex::sdc::control {
         , min_braking_duration_(std::max(0.0, min_braking_duration))
         , sync_threshold_(sync_threshold)
         , neighbor_update_rate_(Clamp(neighbor_update_rate, 0.0, 1.0))
-        , correct_target_for_applied_delta_(correct_target_for_applied_delta) {
+        , correct_target_for_applied_delta_(correct_target_for_applied_delta)
+        , neighbor_kernel_radius_(std::max(0, neighbor_kernel_radius)) {
         // Both thresholds are always used as negative values: braking starts
         // when acceleration drops to or below them.
         if (release_threshold_ >= 0.0) {
@@ -672,29 +674,49 @@ namespace yandex::sdc::control {
 
             // A cell no phase point ever lands on exactly would otherwise stay
             // at its identity delta (0.0) forever, however well its neighbors
-            // are calibrated. Nudge the orthogonal grid neighbors toward the
-            // same freshly observed coefficient too, with a separate
-            // (smaller) rate.
-            if (neighbor_update_rate_ > 0.0) {
-                if (acceleration_index > 0) {
-                    UpdateCellDelta(
-                        (acceleration_index - 1) * n_speed + speed_index,
-                        coefficient_new, neighbor_update_rate_);
-                }
-                if (acceleration_index + 1 < params_.acceleration_points.size()) {
-                    UpdateCellDelta(
-                        (acceleration_index + 1) * n_speed + speed_index,
-                        coefficient_new, neighbor_update_rate_);
-                }
-                if (speed_index > 0) {
-                    UpdateCellDelta(
-                        acceleration_index * n_speed + (speed_index - 1),
-                        coefficient_new, neighbor_update_rate_);
-                }
-                if (speed_index + 1 < n_speed) {
-                    UpdateCellDelta(
-                        acceleration_index * n_speed + (speed_index + 1),
-                        coefficient_new, neighbor_update_rate_);
+            // are calibrated. Propagate the same freshly observed coefficient
+            // to every cell within neighbor_kernel_radius_ grid steps on
+            // both axes (a (2R+1) x (2R+1) window, including diagonals), at
+            // a rate that falls off with grid-index distance -- a Gaussian,
+            // so the window's edge decays smoothly instead of cutting off
+            // sharply (see class doc).
+            if (neighbor_update_rate_ > 0.0 && neighbor_kernel_radius_ > 0) {
+                const double sigma = neighbor_kernel_radius_ / 2.0;
+                const double two_sigma_sq = 2.0 * sigma * sigma;
+                const std::ptrdiff_t radius = neighbor_kernel_radius_;
+                const std::ptrdiff_t center_acc =
+                    static_cast<std::ptrdiff_t>(acceleration_index);
+                const std::ptrdiff_t center_speed =
+                    static_cast<std::ptrdiff_t>(speed_index);
+                const std::ptrdiff_t max_acc =
+                    static_cast<std::ptrdiff_t>(params_.acceleration_points.size()) - 1;
+                const std::ptrdiff_t max_speed =
+                    static_cast<std::ptrdiff_t>(n_speed) - 1;
+
+                for (std::ptrdiff_t da = -radius; da <= radius; ++da) {
+                    const std::ptrdiff_t neighbor_acc = center_acc + da;
+                    if (neighbor_acc < 0 || neighbor_acc > max_acc) {
+                        continue;
+                    }
+                    for (std::ptrdiff_t ds = -radius; ds <= radius; ++ds) {
+                        if (da == 0 && ds == 0) {
+                            continue; // the directly observed cell itself
+                        }
+                        const std::ptrdiff_t neighbor_speed = center_speed + ds;
+                        if (neighbor_speed < 0 || neighbor_speed > max_speed) {
+                            continue;
+                        }
+
+                        const double weight = std::exp(
+                            -(static_cast<double>(da * da) +
+                              static_cast<double>(ds * ds)) /
+                            two_sigma_sq);
+                        const double rate = neighbor_update_rate_ * weight;
+                        const std::size_t neighbor_index =
+                            static_cast<std::size_t>(neighbor_acc) * n_speed +
+                            static_cast<std::size_t>(neighbor_speed);
+                        UpdateCellDelta(neighbor_index, coefficient_new, rate);
+                    }
                 }
             }
         }

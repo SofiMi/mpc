@@ -343,6 +343,37 @@ TEST(BrakeCompensationBuilderTest, NeighboringCellsGetASmallerUpdateToo) {
     EXPECT_GT(moved_cells, directly_touched);
 }
 
+// neighbor_kernel_radius_ controls how far the Gaussian propagation window
+// reaches (see class doc); a wider radius must touch strictly more cells
+// for the same maneuver than a narrow one, since the extra cells sit
+// outside a radius-1 window but inside a radius-4 one.
+TEST(BrakeCompensationBuilderTest, WiderKernelTouchesMoreCellsThanNarrowKernel) {
+    auto run_and_count_moved = [](int radius) {
+        BrakeCompensationBuilder builder(
+            /*release_threshold=*/-0.5, /*update_rate=*/1.0,
+            /*smoothing_window=*/5, /*peak_release_margin=*/0.2,
+            /*median_window=*/5, /*min_braking_duration=*/0.5,
+            /*sync_threshold=*/-0.3, /*neighbor_update_rate=*/0.05,
+            /*correct_target_for_applied_delta=*/true,
+            /*neighbor_kernel_radius=*/radius);
+
+        const auto base = BuildBrakingSignal(/*peak_acc=*/-2.0, 60, 15);
+        FeedStreams(builder, base, base, /*speed=*/5.0);
+
+        std::size_t moved = 0;
+        for (const double value : builder.GetParams().value_points) {
+            if (value != 0.0) {
+                ++moved;
+            }
+        }
+        return moved;
+    };
+
+    const std::size_t moved_radius_1 = run_and_count_moved(1);
+    const std::size_t moved_radius_4 = run_and_count_moved(4);
+    EXPECT_GT(moved_radius_4, moved_radius_1);
+}
+
 // Unlike the old multiplicative EMA (which converged to and stayed at the
 // observed ratio, e.g. 1.3), the new formula folds the currently stored
 // delta back into the numerator each time (coefficient_new = coefficient_old
