@@ -379,6 +379,41 @@ TEST(BrakeCompensationBuilderTest, RepeatedIdenticalMismatchConvergesToClamp) {
     EXPECT_NEAR(previous_max, 1.5, 0.01);
 }
 
+// With correct_target_for_applied_delta = false, coefficient_new no longer
+// re-multiplies by the ratio the cell's own already-stored delta implies --
+// target_sum is compared to localization_sum as-is, exactly like the old
+// multiplicative table. The same repeated mismatch that ran away to the
+// clamp above instead converges to the true observed ratio.
+TEST(BrakeCompensationBuilderTest, WithoutCorrectionRepeatedMismatchConvergesToTrueRatio) {
+    BrakeCompensationBuilder builder(
+        /*release_threshold=*/-0.5, /*update_rate=*/0.2,
+        /*smoothing_window=*/5, /*peak_release_margin=*/0.2,
+        /*median_window=*/5, /*min_braking_duration=*/0.5,
+        /*sync_threshold=*/-0.3, /*neighbor_update_rate=*/0.05,
+        /*correct_target_for_applied_delta=*/false);
+
+    const auto base = BuildBrakingSignal(/*peak_acc=*/-2.0, 60, 15);
+    const auto target = ScaleSignal(base, 1.3);
+
+    double previous_max = 1.0;
+    for (int repeat = 0; repeat < 30; ++repeat) {
+        FeedStreams(builder, base, target, /*speed=*/5.0);
+        // A neutral gap so the next repeat's -0.2 crossing starts a fresh
+        // event rather than continuing the tail of the release ramp.
+        FeedStreams(builder, NeutralSignal(20), NeutralSignal(20), 5.0);
+
+        const BrakeCompensationParams params = builder.GetParams();
+        double current_max = 1.0;
+        for (std::size_t i = 0; i < params.value_points.size(); ++i) {
+            current_max = std::max(current_max, CoefficientAt(params, i));
+        }
+        EXPECT_GE(current_max, previous_max - 1e-9);
+        previous_max = current_max;
+    }
+
+    EXPECT_NEAR(previous_max, 1.3, 0.05);
+}
+
 // Regression test for: Clear() is documented to drop all in-flight state and
 // reset the table, but used to only clear the event/queue state.
 TEST(BrakeCompensationBuilderTest, ClearResetsTableToInitialAllZerosGrid) {

@@ -96,6 +96,13 @@ namespace yandex::sdc::control {
     //         coefficient_old = (acc_grid + delta_old) / acc_grid
     //         coefficient_new = coefficient_old * target_sum / localization_sum
     //
+    //     correct_target_for_applied_delta toggles that correction: when
+    //     false, coefficient_new is plain target_sum / localization_sum
+    //     (target_sum taken as-is, as if no compensation had already been
+    //     applied) -- useful when target_acc fed to Set() is known to be the
+    //     raw, pre-compensation request rather than the actually executed
+    //     command.
+    //
     //     coefficient_new is folded in via an exponential moving average in
     //     ratio space (update_rate_, default weight 0.2 to the new observation,
     //     0.8 to the ratio the old delta implied), then converted back to a
@@ -124,7 +131,8 @@ namespace yandex::sdc::control {
             std::size_t median_window = 5,
             double min_braking_duration = 0.5,
             double sync_threshold = -0.3,
-            double neighbor_update_rate = 0.05);
+            double neighbor_update_rate = 0.05,
+            bool correct_target_for_applied_delta = true);
 
         // Feed one synchronized measurement. `localization_vel` is the current
         // speed, used both as the profile speed and as the table's speed key.
@@ -277,6 +285,7 @@ namespace yandex::sdc::control {
         double min_braking_duration_;
         double sync_threshold_; // stored negative; see class doc
         double neighbor_update_rate_;
+        bool correct_target_for_applied_delta_;
     };
 
 } // namespace yandex::sdc::control

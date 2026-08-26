@@ -71,7 +71,8 @@ namespace yandex::sdc::control {
         std::size_t median_window,
         double min_braking_duration,
         double sync_threshold,
-        double neighbor_update_rate)
+        double neighbor_update_rate,
+        bool correct_target_for_applied_delta)
         : release_threshold_(release_threshold)
         , update_rate_(Clamp(update_rate, 0.0, 1.0))
         , smoothing_half_(smoothing_window > 1 ? smoothing_window / 2 : 0)
@@ -79,7 +80,8 @@ namespace yandex::sdc::control {
         , median_half_(median_window > 1 ? median_window / 2 : 0)
         , min_braking_duration_(std::max(0.0, min_braking_duration))
         , sync_threshold_(sync_threshold)
-        , neighbor_update_rate_(Clamp(neighbor_update_rate, 0.0, 1.0)) {
+        , neighbor_update_rate_(Clamp(neighbor_update_rate, 0.0, 1.0))
+        , correct_target_for_applied_delta_(correct_target_for_applied_delta) {
         // Both thresholds are always used as negative values: braking starts
         // when acceleration drops to or below them.
         if (release_threshold_ >= 0.0) {
@@ -644,8 +646,15 @@ namespace yandex::sdc::control {
 
             const double delta_old = params_.value_points[value_index];
             const double coefficient_old = (acc_grid + delta_old) / acc_grid;
-            const double corrected_target = coefficient_old * cell.target;
-            const double coefficient_new = corrected_target / cell.localization;
+            // With the flag on, cell.target is corrected by coefficient_old
+            // first (see class doc): it's taken to be the already-compensated
+            // command actually executed, not a raw pre-compensation request.
+            // With the flag off, cell.target is compared as-is.
+            const double target_for_ratio =
+                correct_target_for_applied_delta_
+                ? coefficient_old * cell.target
+                : cell.target;
+            const double coefficient_new = target_for_ratio / cell.localization;
             if (!IsFinite(coefficient_new)) {
                 continue;
             }
