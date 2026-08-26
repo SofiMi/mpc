@@ -271,16 +271,53 @@ TEST(BrakeCompensationBuilderTest, CoefficientAboveMaxIsClamped) {
 
     FeedStreams(builder, base, target, /*speed=*/5.0);
 
-    bool any_updated = false;
+    // Every cell (primary or neighbor-nudged) must stay within [1.0, 1.5],
+    // and a directly observed cell -- whose raw coefficient is far above the
+    // ceiling -- must land exactly on it.
+    bool any_at_max = false;
+    for (const double value : builder.GetParams().value_points) {
+        ASSERT_GE(value, 1.0);
+        ASSERT_LE(value, 1.5);
+        if (value > 1.5 - 1e-6) {
+            any_at_max = true;
+        }
+    }
+    EXPECT_TRUE(any_at_max);
+}
+
+// A cell no phase point ever lands on exactly would otherwise stay at 1.0
+// forever, however well-calibrated its neighbors are. Directly observed
+// cells must also nudge their orthogonal grid neighbors toward the same
+// coefficient, at a smaller rate, so calibration diffuses across the grid.
+TEST(BrakeCompensationBuilderTest, NeighboringCellsGetASmallerUpdateToo) {
+    BrakeCompensationBuilder builder(
+        /*release_threshold=*/-0.5, /*update_rate=*/1.0);
+
+    const auto base = BuildBrakingSignal(/*peak_acc=*/-2.0, 60, 15);
+    const auto target = ScaleSignal(base, 1.3);
+
+    // speed=5.0 sits mid-grid (index 5 of 0..10), so its neighbors (4 and 6)
+    // both exist -- this exercises the speed-axis propagation, not just an
+    // edge case.
+    FeedStreams(builder, base, target, /*speed=*/5.0);
+
+    const auto debug = builder.GetDebugInfo();
+    ASSERT_TRUE(debug.has_value());
+    const std::size_t directly_touched = debug->coef_new.size();
+    ASSERT_GT(directly_touched, 0u);
+
+    std::size_t moved_cells = 0;
     for (const double value : builder.GetParams().value_points) {
         ASSERT_GE(value, 1.0);
         ASSERT_LE(value, 1.5);
         if (value > 1.0) {
-            any_updated = true;
-            EXPECT_NEAR(value, 1.5, 1e-6);
+            ++moved_cells;
         }
     }
-    EXPECT_TRUE(any_updated);
+
+    // More cells moved than were directly observed: the extras are
+    // neighbor-nudged, not primary matches.
+    EXPECT_GT(moved_cells, directly_touched);
 }
 
 TEST(BrakeCompensationBuilderTest, RepeatedEventsConvergeViaExponentialMovingAverage) {

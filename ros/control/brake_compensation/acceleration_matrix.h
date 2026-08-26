@@ -78,6 +78,14 @@ namespace yandex::sdc::control {
     //     target_delta_I / localization_delta_I.
     //   * Coefficients are folded into the table with an exponential moving average
     //     (update_rate_), so recent maneuvers matter more than old ones.
+    //   * A cell that no phase point ever lands on exactly would otherwise stay
+    //     at 1.0 forever, even once its neighbors are well calibrated. Each
+    //     directly observed cell also nudges its orthogonal grid neighbors (one
+    //     step along the acceleration axis, one step along the speed axis)
+    //     toward the same observed coefficient, with a separate, smaller
+    //     (neighbor_update_rate_) rate -- so calibration diffuses across the
+    //     grid instead of staying pinned to only the cells phase points happen
+    //     to hit.
     class BrakeCompensationBuilder {
     public:
         explicit BrakeCompensationBuilder(
@@ -87,7 +95,8 @@ namespace yandex::sdc::control {
             double peak_release_margin = 0.2,
             std::size_t median_window = 5,
             double min_braking_duration = 0.5,
-            double sync_threshold = -0.3);
+            double sync_threshold = -0.3,
+            double neighbor_update_rate = 0.05);
 
         // Feed one synchronized measurement. `localization_vel` is the current
         // speed, used both as the profile speed and as the table's speed key.
@@ -212,6 +221,10 @@ namespace yandex::sdc::control {
             const BrakeProfile& target_profile,
             const BrakeProfile& localization_profile);
 
+        // Nudge one grid cell toward `coefficient` with neighbor_update_rate_
+        // (a no-op if `value_index` is out of range).
+        void UpdateNeighborCell(std::size_t value_index, double coefficient);
+
         std::size_t FindNearestSpeedIndex(double speed) const;
         std::size_t FindNearestAccelerationIndex(double acceleration) const;
 
@@ -230,6 +243,7 @@ namespace yandex::sdc::control {
         std::optional<DebugInfo> debug_info_;
         double min_braking_duration_;
         double sync_threshold_; // stored negative; see class doc
+        double neighbor_update_rate_;
     };
 
 } // namespace yandex::sdc::control

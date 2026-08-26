@@ -70,14 +70,16 @@ namespace yandex::sdc::control {
         double peak_release_margin,
         std::size_t median_window,
         double min_braking_duration,
-        double sync_threshold)
+        double sync_threshold,
+        double neighbor_update_rate)
         : release_threshold_(release_threshold)
         , update_rate_(Clamp(update_rate, 0.0, 1.0))
         , smoothing_half_(smoothing_window > 1 ? smoothing_window / 2 : 0)
         , peak_release_margin_(std::max(0.0, peak_release_margin))
         , median_half_(median_window > 1 ? median_window / 2 : 0)
         , min_braking_duration_(std::max(0.0, min_braking_duration))
-        , sync_threshold_(sync_threshold) {
+        , sync_threshold_(sync_threshold)
+        , neighbor_update_rate_(Clamp(neighbor_update_rate, 0.0, 1.0)) {
         // Both thresholds are always used as negative values: braking starts
         // when acceleration drops to or below them.
         if (release_threshold_ >= 0.0) {
@@ -642,6 +644,31 @@ namespace yandex::sdc::control {
             coef_old.push_back(old_value);
             coef_new.push_back(coefficient);
             coef_res.push_back(params_.value_points[value_index]);
+
+            // A cell no phase point ever lands on exactly would otherwise stay
+            // at 1.0 forever, however well its neighbors are calibrated. Nudge
+            // the orthogonal grid neighbors toward the same observed
+            // coefficient too, with a separate (smaller) rate.
+            if (neighbor_update_rate_ > 0.0) {
+                const std::size_t acceleration_index = value_index / n_speed;
+                const std::size_t speed_index = value_index % n_speed;
+                if (acceleration_index > 0) {
+                    UpdateNeighborCell(
+                        (acceleration_index - 1) * n_speed + speed_index, coefficient);
+                }
+                if (acceleration_index + 1 < params_.acceleration_points.size()) {
+                    UpdateNeighborCell(
+                        (acceleration_index + 1) * n_speed + speed_index, coefficient);
+                }
+                if (speed_index > 0) {
+                    UpdateNeighborCell(
+                        acceleration_index * n_speed + (speed_index - 1), coefficient);
+                }
+                if (speed_index + 1 < n_speed) {
+                    UpdateNeighborCell(
+                        acceleration_index * n_speed + (speed_index + 1), coefficient);
+                }
+            }
         }
 
         if (vel.size() > 0) {
@@ -655,6 +682,18 @@ namespace yandex::sdc::control {
             debug_info.coef_res = coef_res;
             debug_info_ = debug_info;
         }
+    }
+
+    void BrakeCompensationBuilder::UpdateNeighborCell(
+        std::size_t value_index, double coefficient) {
+        if (value_index >= params_.value_points.size()) {
+            return;
+        }
+        const double old_value = params_.value_points[value_index];
+        params_.value_points[value_index] = std::clamp(
+            (1.0 - neighbor_update_rate_) * old_value +
+                neighbor_update_rate_ * coefficient,
+            1.0, 1.5);
     }
 
     void BrakeCompensationBuilder::Clear() {
